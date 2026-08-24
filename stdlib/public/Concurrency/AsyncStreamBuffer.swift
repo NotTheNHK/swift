@@ -561,25 +561,8 @@ extension _AsyncStreamStorage.StateMachine {
     }
   }
 
-  mutating func finalize() {
-    switch unsafe consume self.state {
-    case .idle:
-      fatalError("Unexpected state; called in a non-terminal state")
-
-    case .waiting:
-      fatalError("Unexpected state; called in a non-terminal state")
-
-    case .draining(var draining):
-      draining.finalized = true
-      unsafe self = .init(state: .draining(draining))
-
-    case .terminated(var terminated):
-      terminated.finalized = true
-      unsafe self = .init(state: .terminated(terminated))
-    }
-  }
-
-  mutating func finalizeWithFailure() -> Failure? {
+  // called only from `terminate(_:)` when `action` is `.callAndResume`
+  mutating func finalizeFromCallAndResumeAction() -> Failure? {
     switch unsafe consume self.state {
     case .idle:
       fatalError("Unexpected state; called in a non-terminal state")
@@ -595,6 +578,25 @@ extension _AsyncStreamStorage.StateMachine {
       let failure = terminated.failure.take()
       unsafe self = .init(state: .terminated(terminated))
       return failure
+    }
+  }
+
+  // called only from `terminate(_:)` when `action` is `.call`
+  mutating func finalizeFromCallAction() {
+    switch unsafe consume self.state {
+    case .idle:
+      fatalError("Unexpected state; called in a non-terminal state")
+
+    case .waiting:
+      fatalError("Unexpected state; called in a non-terminal state")
+
+    case .draining(var draining):
+      draining.finalized = true
+      unsafe self = .init(state: .draining(draining))
+
+    case .terminated(var terminated):
+      terminated.finalized = true
+      unsafe self = .init(state: .terminated(terminated))
     }
   }
 }
@@ -682,7 +684,7 @@ extension _AsyncStreamStorage {
       unsafe callAndResume.terminationHandler?.invoke(terminationReason)
 
       let failure = withLock { state in
-        return state.finalizeWithFailure()
+        return state.finalizeFromCallAndResumeAction()
       }
 
       if let failure {
@@ -696,9 +698,8 @@ extension _AsyncStreamStorage {
 
     case .call(let terminationHandler):
       terminationHandler?.invoke(terminationReason)
-
       withLock { state in
-        state.finalize()
+        state.finalizeFromCallAction()
       }
 
     case .none:
