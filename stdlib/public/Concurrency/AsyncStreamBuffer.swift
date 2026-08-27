@@ -111,11 +111,12 @@ fileprivate struct Disconnected<Value: ~Copyable>: ~Copyable, @unchecked Sendabl
 ///   - `none`: No action is taken.
 ///
 /// Finalization Behavior:
-/// A throwing stream that has been terminated due to cancellation is unfinalized and can be finalized once
-/// with a specific error from within the `onTermination` closure by calling the `finish(throwing:)` method.
+/// A throwing stream that has been terminated due to cancellation is unfinalized
+/// and can be finalized once with a specific error from within the `onTermination` closure
+/// by calling the `finish(throwing:)` method.
 ///
 /// Specifically, an unfinalized terminal stream is a transient state during the termination process.
-/// If no call to one of the `finish()` methods occurs from within the `onTermination` closure,
+/// If no call to `finish()` / `finish(throwing:)` occurred from within the `onTermination` closure,
 /// the stream will be automatically finalized after the `onTermination` closure has been invoked.
 /// Formally, this automatic finalization happens after the `onTermination` closure has been invoked.
 ///
@@ -571,7 +572,9 @@ extension _AsyncStreamStorage.StateMachine {
     }
   }
 
-  // called only from `terminate(_:)` when `action` is `.callAndResume`
+  // called only from `terminate(_:)` when `action` is `.callAndResume`.
+  // `finalized` is already `true` if `terminate(_:)` was called
+  // with `.finished(Failure?)` before.
   mutating func finalizeFromCallAndResumeAction() -> Failure? {
     switch unsafe consume self.state {
     case .idle:
@@ -591,7 +594,9 @@ extension _AsyncStreamStorage.StateMachine {
     }
   }
 
-  // called only from `terminate(_:)` when `action` is `.call`
+  // called only from `terminate(_:)` when `action` is `.call`.
+  // `finalized` is already `true` if `terminate(_:)`
+  // was called with `.finished(Failure?)` before.
   mutating func finalizeFromCallAction() {
     switch unsafe consume self.state {
     case .idle:
