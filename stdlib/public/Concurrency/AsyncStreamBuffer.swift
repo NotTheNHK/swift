@@ -110,8 +110,18 @@ fileprivate struct Disconnected<Value: ~Copyable>: ~Copyable, @unchecked Sendabl
 ///   - `call`: Only the `TerminationHandler` is invoked.
 ///   - `none`: No action is taken.
 ///
-/// Termination Behavior:
-/// To-Do: Provide a comprehensive explanation of the ‘two-stage’ termination process.
+/// Finalization Behavior:
+/// A throwing stream that has been terminated due to cancellation is unfinalized and can be finalized once
+/// with a specific error from within the `onTermination` closure by calling the `finish(throwing:)` method.
+///
+/// Specifically, an unfinalized terminal stream is a transient state during the termination process.
+/// If no call to one of the `finish()` methods occurs from within the `onTermination` closure,
+/// the stream will be automatically finalized after the `onTermination` closure has been invoked.
+/// Formally, this automatic finalization happens after the `onTermination` closure has been invoked.
+///
+/// - Note: While the same mechanism applies to `AsyncStream`, since it is non-throwing,
+/// whether the termination cause is cancellation or the stream being finished has no effect:
+/// a terminal `AsyncStream` that has drained all its buffered elements will always return `nil`.
 ///
 /// Behavior:
 /// The state machine is single-consumer–based. However, instead of crashing on concurrent iteration,
@@ -571,7 +581,7 @@ extension _AsyncStreamStorage.StateMachine {
       fatalError("Unexpected state; called in a non-terminal state")
 
     case .draining:
-      fatalError("Unexpected state; called in a non-terminal state")
+      fatalError("Unexpected state; called in the wrong state")
 
     case .terminated(var terminated):
       terminated.finalized = true
