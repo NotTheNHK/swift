@@ -14,6 +14,7 @@
 
 import _Concurrency
 import StdlibUnittest
+import Dispatch
 
 struct SomeError: Error, Equatable {
   var value: Int = 0
@@ -506,6 +507,51 @@ class NotSendable {}
           expectEqual(failure, firstError)
         } else {
           expectUnreachable("expected SomeError, got \(String(describing: caught))")
+        }
+      }
+
+      tests.test("finish(throwing:) from onTermination is not lost to a concurrent next() during termination") {
+        let thrownError = SomeError()
+
+        let (controlStream, controlContinuation) = AsyncStream<Int>.makeStream()
+        var controlIterator = controlStream.makeAsyncIterator()
+
+        let (stream, continuation) = AsyncThrowingStream<Int, Error>.makeStream()
+
+        continuation.onTermination = { @Sendable termination in
+          guard case .cancelled = termination else { return }
+
+          // Start an unstructured task consuming next() which we'll race with the finish() call below.
+          let nextSemaphore = DispatchSemaphore(value: 0)
+          Task.detached {
+            var iterator = stream.makeAsyncIterator()
+            nextSemaphore.signal()
+            _ = try? await iterator.next()
+          }
+          nextSemaphore.wait()
+
+          continuation.finish(throwing: thrownError) // We must consistently see the error thrown from the handler
+        }
+
+        let task = Task { () -> Error? in
+          controlContinuation.yield(1)
+          do {
+            for try await _ in stream {}
+            return nil
+          } catch {
+            return error
+          }
+        }
+
+        expectEqual(await controlIterator.next(), 1)
+        task.cancel()
+
+        let caught = await task.value
+        if let failure = caught as? SomeError {
+          expectEqual(failure, thrownError)
+        } else {
+          expectUnreachable(
+            "cancelled consumer lost the onTermination finish(throwing:) error to a concurrent next(); got \(String(describing: caught))")
         }
       }
 
