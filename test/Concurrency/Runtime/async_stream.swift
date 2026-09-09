@@ -446,7 +446,7 @@ class NotSendable {}
         let (controlStream, controlContinuation) = AsyncStream<Int>.makeStream()
         var controlIterator = controlStream.makeAsyncIterator()
 
-        let task = Task { () -> Error? in
+        let task = Task { @MainActor () -> Error? in
           let stream = AsyncThrowingStream<Int, Error> { continuation in
             continuation.onTermination = { @Sendable termination in
               if case .cancelled = termination {
@@ -463,7 +463,7 @@ class NotSendable {}
           }
         }
 
-        expectEqual(await controlIterator.next(), 1)
+        expectEqual(await controlIterator.next(isolation: #isolation), 1)
         task.cancel()
 
         let caught = await task.value
@@ -481,7 +481,7 @@ class NotSendable {}
         let (controlStream, controlContinuation) = AsyncStream<Int>.makeStream()
         var controlIterator = controlStream.makeAsyncIterator()
 
-        let task = Task { () -> Error? in
+        let task = Task { @MainActor () -> Error? in
           let stream = AsyncThrowingStream<Int, Error> { continuation in
             continuation.onTermination = { @Sendable termination in
               if case .cancelled = termination {
@@ -500,7 +500,7 @@ class NotSendable {}
           }
         }
 
-        expectEqual(await controlIterator.next(), 1)
+        expectEqual(await controlIterator.next(isolation: #isolation), 1)
         task.cancel()
 
         let caught = await task.value
@@ -556,6 +556,33 @@ class NotSendable {}
         } else {
           expectUnreachable(
             "cancelled consumer lost the onTermination finish(throwing:) error to a concurrent next(); got \(String(describing: caught))")
+        }
+      }
+
+      tests.test("finish(throwing:) from onTermination keeps the first error when alredy finished") {
+        let firstError = SomeError(value: 1)
+        let secondError = SomeError(value: 2)
+
+        let stream = AsyncThrowingStream<Void, Error> { continuation in
+          continuation.onTermination = { reason in
+            if case .finished = reason {
+              continuation.finish(throwing: secondError)
+            } else {
+              expectUnreachable("expected `.finished` termination reason got `.cancelled`")
+            }
+          }
+          continuation.finish(throwing: firstError)
+        }
+
+        do {
+          for try await _ in stream {}
+          expectUnreachable("expected thrown error")
+        } catch {
+          if let error = error as? SomeError {
+            expectEqual(error, firstError)
+          } else {
+            expectUnreachable("expected SomeError, got \(String(describing: error))")
+          }
         }
       }
 
