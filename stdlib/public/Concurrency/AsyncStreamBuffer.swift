@@ -80,21 +80,20 @@ fileprivate struct Disconnected<Value: ~Copyable>: ~Copyable, @unchecked Sendabl
 ///      and new elements are directly delivered to the next consumer.
 ///   - `draining`: The stream accepts **no new elements**,
 ///      consumers drain the buffer, which **initially contains at least one element**.
-///      and new elements are directly delivered to the next consumer.
-///   - `terminating`: The stream is terminating,
-///      and is currently running the termination handler, before moving on to terminated.
-///   - `terminated`: The stream is in a terminal state,
-///      **no new elements are accepted**, and **new consumers return immediately**.
+///   - `terminating`: The stream accepts **no new elements**,
+///      consumers are enqueued, and may initially contain zero consumers.
+///   - `terminated`: The stream accepts **no new elements**,
+///      **consumers are not enqueued** and resumed immediately.
 ///
 /// Transitions:
 ///
 /// ```text
 /// Current State   Possible Next State
 /// -------------   -------------------
-/// idle          ->  idle, waiting, finalizing
-/// waiting       ->  idle, waiting, finalizing
-/// finalizing    ->  finalizing, draining, terminated
-/// draining      ->  draining, terminated
+/// idle          ->  idle, waiting, draining, terminating
+/// waiting       ->  idle, waiting, terminating
+/// draining      ->  draining, terminating, terminated
+/// terminating   ->  terminating, terminated
 /// terminated    ->  terminated
 /// ```
 ///
@@ -118,19 +117,17 @@ fileprivate struct Disconnected<Value: ~Copyable>: ~Copyable, @unchecked Sendabl
 ///   - `none`: No action is taken.
 ///
 /// Concurrent Behavior:
+///
 /// The state machine is single-consumer–base,
-/// every yielded element, is at most once, deliverd to only a singel consumer.
-/// However, instead of crashing on concurrent iteration,
-/// the consumer that “loses” the race to `next()` is enqueued in a **FIFO queue** and **eventually resumed**.
+/// yielded elements are, at most once, deliverd to a singel consumer.
+/// However, on concurrent iteration, consumers are enqueued
+/// in a **FIFO queue** and **eventually resumed**.
 ///
 /// `onTermination` Behavior:
-/// The `onTermination` closure will be formally called once during the termination process and cleard afterwards.
-/// A stream that is in an non-active state (i.e. neither `idle.` nor `.waiting`)
-/// retains the ability to read/write to the `onTermination` property but lacks the ability
-/// to invoke the stored `onTermination` closure: A stream has a singel opportunity to invokde
-/// the `onTermination` closure, thats is during the termination process after `terminate()` was called the first time.
-/// Even If no `onTermination` closure was set before the call to `terminate()` once the termination process has started/finished
-/// it is not possible to invoke the stored `onTermination` closure.
+///
+/// Every state permits assigning a new closure to the `onTermination` property,
+/// including `.terminated`. However, regardless of whether `onTermination` is `nil`
+/// once the stream has been terminated, it is impossible to invoke `onTermination` again.
 ///
 /// Finishing Behavior:
 /// A throwing stream that has been **terminated due to cancellation is unfinished**,
@@ -139,19 +136,14 @@ fileprivate struct Disconnected<Value: ~Copyable>: ~Copyable, @unchecked Sendabl
 ///
 /// Specifically, an unfinished terminal stream is itself a transient state
 /// during the finalization process. If no call to `finish()` / `finish(throwing:)`
-/// occurs during finalization, e.g., from within the `onTermination` closure,
-/// the stream will be **automatically finished** after the `onTermination`
-/// closure has been invoked. Formally, this automatic finishing behavior
-/// happens after the `onTermination` closure has been invoked.
+/// occurs during finalization, e.g., from within `onTermination`,
+/// the stream will be **automatically finished** after `onTermination`
+/// was invoked.
 ///
 /// - Note: While the same mechanism applies to `AsyncStream`,
 /// since it is non-throwing, whether the termination reason is cancellation
 /// or the stream being finished makes no difference: a terminal `AsyncStream`
 /// that has drained all its buffered elements will always return `nil`.
-///
-/// Termination Behavior:
-/// Once the stream has reached a terminal state and all buffered elements have been drained,
-/// subsequent consumers will **immediately return nil**, and any yielded value is is rejected.
 @safe
 internal final class _AsyncStreamStorage<
   Element, Failure: Error, PublicTermination
