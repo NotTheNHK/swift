@@ -98,6 +98,9 @@
 #include "llvm/Transforms/ObjCARC.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/DCE.h"
+#if LLVM_VERSION_MAJOR >= 23
+#include "llvm/Transforms/Utils/AssignGUID.h"
+#endif
 #include "llvm/Transforms/Utils/Instrumentation.h"
 
 #include "llvm/CodeGen/MachineOptimizationRemarkEmitter.h"
@@ -153,6 +156,8 @@ swift::getIRTargetOptions(const IRGenOptions &Opts, ASTContext &Ctx,
   // Explicitly request debugger tuning for LLDB which is the default
   // on Darwin platforms but not on others.
   TargetOpts.DebuggerTuning = llvm::DebuggerKind::LLDB;
+
+  TargetOpts.EmitCallSiteInfo = Opts.DebugCallsiteInfo;
   TargetOpts.FunctionSections = Opts.FunctionSections;
 
   // Set option to UseCASBackend if CAS was enabled on the command line.
@@ -614,6 +619,12 @@ void swift::performLLVMOptimizations(
         TargetMachine->getTargetTriple().getVendor() != llvm::Triple::Apple;
 
     if (Opts.LLVMLTOKind == IRGenLLVMLTOKind::Thin) {
+#if LLVM_VERSION_MAJOR >= 23
+      // ThinLTOBitcodeWriterPass requests ModuleSummaryIndexAnalysis, which
+      // requires a GUID to be assigned to every GlobalValue. The LTO prelink
+      // pipelines do that via AssignGUIDPass, but the O0 pipeline does not.
+      MPM.addPass(AssignGUIDPass());
+#endif
       MPM.addPass(ThinLTOBitcodeWriterPass(*out, nullptr));
     } else {
       if (EmitRegularLTOSummary) {
@@ -623,6 +634,12 @@ void swift::performLLVMOptimizations(
         // lto summary.)
         Module->addModuleFlag(llvm::Module::Error, "EnableSplitLTOUnit",
                               uint32_t(1));
+#if LLVM_VERSION_MAJOR >= 23
+        // BitcodeWriterPass with EmitSummaryIndex requests
+        // ModuleSummaryIndexAnalysis, which requires a GUID to be assigned to
+        // every GlobalValue; the per-module/O0 pipelines do not do that.
+        MPM.addPass(AssignGUIDPass());
+#endif
       }
       MPM.addPass(BitcodeWriterPass(
           *out, /*ShouldPreserveUseListOrder*/ false, EmitRegularLTOSummary));

@@ -2884,27 +2884,29 @@ bool swift::diagnoseMissingOwnership(ParamSpecifier ownership,
   auto loc = repr->getLoc();
   repr->setInvalid();
 
-  // We don't yet support any ownership specifiers for parameters of subscript
-  // decls, give a tailored error message saying you simply can't use a
-  // noncopyable type here.
-  if (options.hasBase(TypeResolverContext::SubscriptDecl)) {
+  // Without SubscriptParametersWithOwnership there is no ownership specifier
+  // to suggest for a subscript parameter, so say that the type simply cannot
+  // be used here.
+  if (options.hasBase(TypeResolverContext::SubscriptDecl) &&
+      !resolution.getASTContext().LangOpts.hasFeature(
+          Feature::SubscriptParametersWithOwnership)) {
     diags.diagnose(loc, diag::noncopyable_parameter_subscript_unsupported);
-  } else {
-    // general error diagnostic
-    diags.diagnose(loc, diag::noncopyable_parameter_requires_ownership, ty);
-
-    diags.diagnose(loc, diag::noncopyable_parameter_ownership_suggestion,
-                   "borrowing", "for an immutable reference")
-        .fixItInsert(repr->getStartLoc(), "borrowing ");
-
-    diags.diagnose(loc, diag::noncopyable_parameter_ownership_suggestion,
-                   "inout", "for a mutable reference")
-        .fixItInsert(repr->getStartLoc(), "inout ");
-
-    diags.diagnose(loc, diag::noncopyable_parameter_ownership_suggestion,
-                   "consuming", "to take the value from the caller")
-        .fixItInsert(repr->getStartLoc(), "consuming ");
+    return true;
   }
+
+  diags.diagnose(loc, diag::noncopyable_parameter_requires_ownership, ty);
+
+  diags.diagnose(loc, diag::noncopyable_parameter_ownership_suggestion,
+                 "borrowing", "for an immutable reference")
+      .fixItInsert(repr->getStartLoc(), "borrowing ");
+
+  diags.diagnose(loc, diag::noncopyable_parameter_ownership_suggestion,
+                 "inout", "for a mutable reference")
+      .fixItInsert(repr->getStartLoc(), "inout ");
+
+  diags.diagnose(loc, diag::noncopyable_parameter_ownership_suggestion,
+                 "consuming", "to take the value from the caller")
+      .fixItInsert(repr->getStartLoc(), "consuming ");
 
   return true;
 }
@@ -4962,26 +4964,26 @@ NeverNullType TypeResolver::resolveSILFunctionType(FunctionTypeRepr *repr,
   auto conventionAttr = claim<ConventionTypeAttr>(attrs);
   if (conventionAttr) {
     auto parsedRep =
-      llvm::StringSwitch<std::optional<SILFunctionType::Representation>>(
+        llvm::StringSwitch<std::optional<SILFunctionType::Representation>>(
             conventionAttr->getConventionName())
-        .Case("thick", SILFunctionType::Representation::Thick)
-        .Case("block", SILFunctionType::Representation::Block)
-        .Case("thin", SILFunctionType::Representation::Thin)
-        .Case("c", SILFunctionType::Representation::CFunctionPointer)
-        .Case("method", SILFunctionType::Representation::Method)
-        .Case("objc_method",
-              SILFunctionType::Representation::ObjCMethod)
-        .Case("witness_method",
-              SILFunctionType::Representation::WitnessMethod)
-        .Case("keypath_accessor_getter",
-              SILFunctionType::Representation::KeyPathAccessorGetter)
-        .Case("keypath_accessor_setter",
-              SILFunctionType::Representation::KeyPathAccessorSetter)
-        .Case("keypath_accessor_equals",
-              SILFunctionType::Representation::KeyPathAccessorEquals)
-        .Case("keypath_accessor_hash",
-              SILFunctionType::Representation::KeyPathAccessorHash)
-        .Default(std::nullopt);
+            .Case("thick", SILFunctionType::Representation::Thick)
+            .Case("block", SILFunctionType::Representation::Block)
+            .Case("thin", SILFunctionType::Representation::Thin)
+            .Case("c", SILFunctionType::Representation::CFunctionPointer)
+            .Case("method", SILFunctionType::Representation::Method)
+            .Case("com_method", SILFunctionType::Representation::COMMethod)
+            .Case("objc_method", SILFunctionType::Representation::ObjCMethod)
+            .Case("witness_method",
+                  SILFunctionType::Representation::WitnessMethod)
+            .Case("keypath_accessor_getter",
+                  SILFunctionType::Representation::KeyPathAccessorGetter)
+            .Case("keypath_accessor_setter",
+                  SILFunctionType::Representation::KeyPathAccessorSetter)
+            .Case("keypath_accessor_equals",
+                  SILFunctionType::Representation::KeyPathAccessorEquals)
+            .Case("keypath_accessor_hash",
+                  SILFunctionType::Representation::KeyPathAccessorHash)
+            .Default(std::nullopt);
     if (!parsedRep) {
       conventionAttr->setInvalid();
       diagnoseInvalid(repr, conventionAttr->getAtLoc(),
@@ -5684,18 +5686,24 @@ NeverNullType
 TypeResolver::resolveOwnershipTypeRepr(OwnershipTypeRepr *repr,
                                        TypeResolutionOptions options) {
   auto ownershipRepr = dyn_cast<OwnershipTypeRepr>(repr);
-  // ownership is only valid for (non-Subscript and non-EnumCaseDecl)
-  // function parameters.
+
+  // Ownership is valid on function, initializer, and subscript parameters,
+  // but not on enum case payloads. Subscript parameters are only allowed
+  // ownership under the SubscriptParametersWithOwnership feature.
+  bool ownershipOnSubscriptParams =
+      getASTContext().LangOpts.hasFeature(
+          Feature::SubscriptParametersWithOwnership);
   if (!options.is(TypeResolverContext::FunctionInput) ||
-      options.hasBase(TypeResolverContext::SubscriptDecl) ||
-      options.hasBase(TypeResolverContext::EnumElementDecl)) {
+      options.hasBase(TypeResolverContext::EnumElementDecl) ||
+      (options.hasBase(TypeResolverContext::SubscriptDecl) &&
+       !ownershipOnSubscriptParams)) {
 
     decltype(diag::attr_only_on_parameters) diagID;
-    if (options.hasBase(TypeResolverContext::SubscriptDecl) ||
-        options.hasBase(TypeResolverContext::EnumElementDecl)) {
-      diagID = diag::attr_only_valid_on_func_or_init_params;
-    } else if (options.is(TypeResolverContext::VariadicFunctionInput)) {
+    if (options.is(TypeResolverContext::VariadicFunctionInput)) {
       diagID = diag::attr_not_on_variadic_parameters;
+    } else if (options.hasBase(TypeResolverContext::SubscriptDecl) ||
+               options.hasBase(TypeResolverContext::EnumElementDecl)) {
+      diagID = diag::attr_only_valid_on_func_or_init_params;
     } else {
       diagID = diag::attr_only_on_parameters;
     }
@@ -6574,8 +6582,9 @@ TypeResolver::validateCOMExistential(Type constraintType, TypeRepr *repr,
 
   auto layout = constraintType->getExistentialLayout();
   auto resolution = layout.resolveCOMInterface();
-  if (resolution.containsCOMInterfaceProtocol) {
-    diagnose(repr->getLoc(), diag::com_cominterface_existential);
+  if (resolution.identityProtocol) {
+    diagnose(repr->getLoc(), diag::com_identity_existential,
+             resolution.identityProtocol->getName().str());
     repr->setInvalid();
     return ErrorType::get(ctx);
   }
