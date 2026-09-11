@@ -130,6 +130,7 @@ fileprivate struct Disconnected<Value: ~Copyable>: ~Copyable, @unchecked Sendabl
 /// once the stream has been terminated, it is impossible to invoke `onTermination` again.
 ///
 /// Finishing Behavior:
+///
 /// A throwing stream that has been **terminated due to cancellation is unfinished**,
 /// and can be **finished once** with a specific error
 /// by calling the `finish(throwing:)` method.
