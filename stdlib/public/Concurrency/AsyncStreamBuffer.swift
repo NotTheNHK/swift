@@ -301,25 +301,6 @@ extension _AsyncStreamStorage.StateMachine {
     }
   }
 
-  enum DrainingDecision {
-    case keepDraining
-    case transitionToTerminated(Failure?)
-    case transitionToTerminating
-
-    init(
-      bufferIsEmpty: Bool,
-      terminationReason: TerminationReason
-    ) {
-      if !bufferIsEmpty {
-        self = .keepDraining
-      } else if case .finished(let failure) = terminationReason {
-        self = .transitionToTerminated(failure)
-      } else {
-        self = .transitionToTerminating
-      }
-    }
-  }
-
   func getOnTermination() -> TerminationHandler? {
     switch unsafe self.state { // TODO: Return a TerminationHandler only in certain states
     case .idle(let idle):
@@ -490,27 +471,23 @@ extension _AsyncStreamStorage.StateMachine {
 
     case .draining(var draining):
       let element = draining.buffer.removeFirst()
-      let decision = DrainingDecision(
-        bufferIsEmpty: draining.buffer.isEmpty,
-        terminationReason: draining.terminationReason
-      )
 
-      switch decision {
-      case .keepDraining:
-        unsafe self = .init(state: .draining(draining))
-
-      case .transitionToTerminated(let failure):
+      switch draining.terminationReason {
+      case .finished(let failure) where draining.buffer.isEmpty:
         unsafe self = .init(state: .terminated(.init(
           failure: failure,
           terminationHandler: draining.terminationHandler.take()
         )))
 
-      case .transitionToTerminating:
+      case .cancelled where draining.buffer.isEmpty:
         unsafe self = .init(state: .terminating(.init(
           consumers: [],
           terminationReason: draining.terminationReason,
           terminationHandler: draining.terminationHandler.take()
         )))
+
+      default:
+        unsafe self = .init(state: .draining(draining))
       }
 
       return unsafe .resume(
@@ -545,13 +522,19 @@ extension _AsyncStreamStorage.StateMachine {
   mutating func terminate(_ terminationReason: TerminationReason) -> TerminateAction {
     switch unsafe consume self.state {
     case .idle(var idle):
-      if idle.buffer.isEmpty {
+      switch terminationReason {
+      case .finished(let failure) where idle.buffer.isEmpty:
+        unsafe self = .init(state: .terminated(.init(
+          failure: failure
+        )))
+
+      case .cancelled where idle.buffer.isEmpty:
         unsafe self = .init(state: .terminating(.init(
           consumers: [],
           terminationReason: terminationReason
         )))
 
-      } else {
+      default:
         unsafe self = .init(state: .draining(.init(
           buffer: idle.buffer,
           terminationReason: terminationReason
@@ -563,10 +546,19 @@ extension _AsyncStreamStorage.StateMachine {
       )
 
     case .waiting(var waiting):
-      unsafe self = .init(state: .terminating(.init(
-        consumers: waiting.consumers,
-        terminationReason: terminationReason
-      )))
+      switch terminationReason {
+      case .finished(let failure) where waiting.consumers.isEmpty:
+        unsafe self = .init(state: .terminated(.init(
+          failure: failure
+        )))
+
+      default:
+        unsafe self = .init(state: .terminating(.init(
+          consumers: waiting.consumers,
+          terminationReason: terminationReason
+        )))
+      }
+
       return unsafe .finalize(
         terminationHandler: waiting.terminationHandler.take()
       )
@@ -609,10 +601,6 @@ extension _AsyncStreamStorage.StateMachine {
       return unsafe .none
 
     case .terminating(var terminating):
-      if case .cancelled = unsafe terminating.terminationReason {
-        unsafe terminating.terminationReason = .finished(nil)
-      }
-
       let failure: Failure?
 
       switch unsafe terminating.terminationReason {
@@ -715,11 +703,11 @@ extension _AsyncStreamStorage {
     case .finalize(let terminationHandler):
       terminationHandler?.invoke(terminationReason)
 
-      let action = withLock { state in
+      let finalizeAction = withLock { state in
         return unsafe state.finalize()
       }
 
-      switch unsafe consume action {
+      switch unsafe consume finalizeAction {
       case .resume(var consumers, let failure):
         if let failure {
           let consumer = unsafe consumers.removeFirst()
