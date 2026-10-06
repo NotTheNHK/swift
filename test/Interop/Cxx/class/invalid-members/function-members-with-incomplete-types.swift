@@ -62,6 +62,7 @@ struct GoodStruct {
 // CHECK:      struct GoodStruct {
 // CHECK-NEXT:   init()
 //
+// CHECK-NEXT:   @available(*, unavailable, message: "return type is unavailable in Swift")
 // CHECK-NEXT:   func badReturn() -> Never
 //
 // NOTE-MISSING: func badArg(_: Never)
@@ -76,7 +77,9 @@ struct GoodStruct {
 //
 // NOTE-MISSING: static func +(lhs: GoodStruct, rhs: Never) -> Int32
 //
+// CHECK-NEXT:   @available(*, unavailable, message: "return type is unavailable in Swift")
 // CHECK-NEXT:   func __beginUnsafe() -> Never
+// CHECK-NEXT:   @available(*, unavailable, message: "return type is unavailable in Swift")
 // CHECK-NEXT:   func __endUnsafe() -> Never
 // CHECK-NEXT: }
 
@@ -85,8 +88,8 @@ struct DerivedGoodStruct : GoodStruct {};
 // CHECK:      struct DerivedGoodStruct {
 // CHECK-NEXT:   init()
 // CHECK-NEXT:   func badReturn() -> Never
-// CHECK-NEXT:   func overloadsSameNumArgs(_: CInt)
-// CHECK-NEXT:   func overloadsDiffNumArgs(_: CInt, _: CInt)
+// CHECK-NEXT:   func overloadsSameNumArgs(_ __param0: CInt)
+// CHECK-NEXT:   func overloadsDiffNumArgs(_ __param0: CInt, _ __param1: CInt)
 // CHECK-NEXT:   func __beginUnsafe() -> Never
 // CHECK-NEXT:   func __endUnsafe() -> Never
 // CHECK-NEXT: }
@@ -100,8 +103,8 @@ struct UsingGoodStruct : GoodStruct {
 // CHECK:      struct UsingGoodStruct {
 // CHECK-NEXT:   init()
 // CHECK-NEXT:   func badReturn() -> Never
-// CHECK-NEXT:   func overloadsSameNumArgs(_: CInt)
-// CHECK-NEXT:   func overloadsDiffNumArgs(_: CInt, _: CInt)
+// CHECK-NEXT:   func overloadsSameNumArgs(_ __param0: CInt)
+// CHECK-NEXT:   func overloadsDiffNumArgs(_ __param0: CInt, _ __param1: CInt)
 // CHECK-NEXT:   func __beginUnsafe() -> Never
 // CHECK-NEXT:   func __endUnsafe() -> Never
 // CHECK-NEXT: }

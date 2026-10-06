@@ -216,6 +216,11 @@ extension TypeProperties {
   /// True if this the nominal type `Swift.Optional`.
   public var isOptional: Bool { rawType.bridged.isOptional() }
 
+  /// True if no value of this type can exist, e.g. `Never`, a case-less enum, or a tuple which
+  /// contains such a type. Note that this doesn't take resilience into account: a case-less enum
+  /// from another module can gain cases in a future version of that module.
+  public var isStructurallyUninhabited: Bool { rawType.bridged.isStructurallyUninhabited() }
+
   /// A non-nil result type implies isUnsafe[Raw][Mutable]Pointer. A raw
   /// pointer has a `void` element type.
   public var unsafePointerElementType: Type? {
@@ -473,3 +478,6 @@ extension CanonicalType: Hashable {
 }
 
 public typealias GenericTypeParameterKind = swift.GenericTypeParamKind
+
+/// The execution semantics of a function type, such as `@called(atMostOnce)`.
+public typealias ExecutionSemantics = swift.ExecutionSemantics

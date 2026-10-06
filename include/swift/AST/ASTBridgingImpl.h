@@ -251,6 +251,10 @@ BridgedASTType BridgedDeclObj::Enum_getRawType() const {
   return {nullptr};
 }
 
+bool BridgedDeclObj::Enum_hasCasesUnavailableDuringLowering() const {
+  return getAs<swift::EnumDecl>()->hasCasesUnavailableDuringLowering();
+}
+
 bool BridgedDeclObj::Struct_hasUnreferenceableStorage() const {
   return getAs<swift::StructDecl>()->hasUnreferenceableStorage();
 }
@@ -299,6 +303,11 @@ BridgedDeclObj BridgedDeclObj::ProtocolDecl_getInheritedProtocols(SwiftInt index
 
 bool BridgedDeclObj::AbstractFunction_isOverridden() const {
   return getAs<swift::AbstractFunctionDecl>()->isOverridden();
+}
+
+bool BridgedDeclObj::AbstractFunction_isDistributedWitnessWithAdHocSerializationRequirement() const {
+  return getAs<swift::AbstractFunctionDecl>()
+      ->isDistributedWitnessWithAdHocSerializationRequirement();
 }
 
 bool BridgedDeclObj::Constructor_isInheritable() const {
@@ -715,6 +724,10 @@ bool BridgedASTType::isOptional() const {
   return unbridged()->getCanonicalType()->isOptional();
 }
 
+bool BridgedASTType::isStructurallyUninhabited() const {
+  return unbridged()->isStructurallyUninhabited();
+}
+
 bool BridgedASTType::isUnownedStorageType() const {
   return unbridged()->is<swift::UnownedStorageType>();
 }
@@ -952,6 +965,10 @@ BridgedConformance BridgedConformance::getGenericConformance() const {
   return {swift::ProtocolConformanceRef(specPC->getGenericConformance())};
 }
 
+BridgedConformance BridgedConformance::getCanonicalConformance() const {
+  return {unbridged().getCanonicalConformanceRef()};
+}
+
 BridgedConformance BridgedConformance::getInheritedConformance() const {
   auto *inheritedConf = swift::cast<swift::InheritedProtocolConformance>(unbridged().getConcrete());
   return {swift::ProtocolConformanceRef(inheritedConf->getInheritedConformance())};
@@ -1062,6 +1079,11 @@ bool BridgedSubstitutionMap::isEqualTo(BridgedSubstitutionMap rhs) const {
 
 bool BridgedSubstitutionMap::hasAnySubstitutableParams() const {
   return unbridged().hasAnySubstitutableParams();
+}
+
+BridgedSubstitutionMap
+BridgedSubstitutionMap::subst(BridgedSubstitutionMap subMap) const {
+  return unbridged().subst(subMap.unbridged());
 }
 
 SwiftInt BridgedSubstitutionMap::getNumConformances() const {

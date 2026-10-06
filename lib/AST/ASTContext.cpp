@@ -27,7 +27,6 @@
 #include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticEngine.h"
-#include "swift/AST/DiagnosticsFrontend.h"
 #include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/DistributedDecl.h"
 #include "swift/AST/ExistentialLayout.h"
@@ -63,8 +62,6 @@
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/AST/SynthesizedFileUnit.h"
 #include "swift/AST/TypeCheckRequests.h"
-#include "swift/AST/TypeTransform.h"
-#include "swift/Basic/APIntMap.h"
 #include "swift/Basic/Assertions.h"
 #include "swift/Basic/BasicBridging.h"
 #include "swift/Basic/BlockList.h"
@@ -72,8 +69,6 @@
 #include "swift/Basic/Feature.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/Statistic.h"
-#include "swift/Basic/StringExtras.h"
-#include "swift/Bridging/ASTGen.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/Frontend/ModuleInterfaceLoader.h"
 #include "swift/Serialization/SerializedModuleLoader.h"
@@ -90,13 +85,11 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/Compiler.h"
-#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/VersionTuple.h"
 #include "llvm/Support/VirtualOutputBackend.h"
 #include "llvm/Support/VirtualOutputBackends.h"
 #include <algorithm>
 #include <memory>
-#include <queue>
 
 #if !defined(_WIN32)
 #include <dlfcn.h>
@@ -222,21 +215,6 @@ template <> struct DenseMapInfo<OverrideSignatureKey> {
            lhs.derivedParams == rhs.derivedParams;
   }
 
-  static inline OverrideSignatureKey getEmptyKey() {
-    return OverrideSignatureKey(DenseMapInfo<GenericSignature>::getEmptyKey(),
-                                DenseMapInfo<NominalTypeDecl *>::getEmptyKey(),
-                                DenseMapInfo<NominalTypeDecl *>::getEmptyKey(),
-                                DenseMapInfo<GenericParamList *>::getEmptyKey());
-  }
-
-  static inline OverrideSignatureKey getTombstoneKey() {
-    return OverrideSignatureKey(
-        DenseMapInfo<GenericSignature>::getTombstoneKey(),
-        DenseMapInfo<NominalTypeDecl *>::getTombstoneKey(),
-        DenseMapInfo<NominalTypeDecl *>::getTombstoneKey(),
-        DenseMapInfo<GenericParamList *>::getTombstoneKey());
-  }
-
   static unsigned getHashValue(const OverrideSignatureKey &Val) {
     return hash_combine(
         DenseMapInfo<GenericSignature>::getHashValue(Val.baseMethodSig),
@@ -329,6 +307,10 @@ struct ASTContext::Implementation {
   /** The declaration of MODULE.NAME. */ \
   DECL_CLASS *NAME##Decl = nullptr;
 #include "swift/AST/KnownSDKTypes.def"
+
+  /// The declaration of the CGFloat struct, which is not vended by a fixed
+  /// module and so cannot live in KnownSDKTypes.def.
+  StructDecl *CGFloatDecl = nullptr;
 
   /// The declaration of '+' function for two RangeReplaceableCollection.
   FuncDecl *PlusFunctionOnRangeReplaceableCollection = nullptr;
@@ -1611,6 +1593,12 @@ MacroDecl *ASTContext::getBuiltinDerivedConformanceMacroDecl(
                       {stringParam("", "infos")},
                       MacroIntroducedDeclName::getArbitrary());
     break;
+  case BuiltinDerivedConformanceMacroKind::DeriveRawRepresentable:
+    macro = makeMacro("_deriveRawRepresentable", "DeriveRawRepresentableMacro",
+                      {stringParam("", "infos"), stringParam("", "witness"),
+                       boolParam("", "isStrictMemorySafety")},
+                      MacroIntroducedDeclName::getArbitrary());
+    break;
   case BuiltinDerivedConformanceMacroKind::NumKinds:
     llvm_unreachable("not a real kind");
   }
@@ -1908,6 +1896,49 @@ ConcreteDeclRef ASTContext::getRegexInitDecl(Type regexType) const {
   return ConcreteDeclRef(foundDecl, subs);
 }
 
+StructDecl *ASTContext::getCGFloatDecl() const {
+  if (getImpl().CGFloatDecl)
+    return getImpl().CGFloatDecl;
+
+  // CGFloat is declared by the CoreFoundation overlay on Darwin, and by
+  // Foundation on other platforms. Keep this list in sync with
+  // TypeBase::isCGFloat().
+  const Identifier moduleNames[] = {Id_CoreFoundation, Id_Foundation,
+                                    Id_CoreGraphics};
+
+  for (auto moduleName : moduleNames) {
+    ModuleDecl *M = getLoadedModule(moduleName);
+    if (!M)
+      continue;
+
+    // Note: lookupQualified() will search both the Swift overlay and the
+    // Clang module it imports. On platforms where CGFloat is a C typedef
+    // rather than a Swift struct, we skip the result and try the next
+    // module.
+    SmallVector<ValueDecl *, 2> decls;
+    M->lookupQualified(M, DeclNameRef(Id_CGFloat), SourceLoc(),
+                       NLFlags::OnlyTypes, decls);
+
+    for (auto *found : decls) {
+      auto *decl = dyn_cast<StructDecl>(found);
+      if (!decl || !decl->getDeclContext()->isModuleScopeContext())
+        continue;
+
+      getImpl().CGFloatDecl = decl;
+      return decl;
+    }
+  }
+
+  return nullptr;
+}
+
+Type ASTContext::getCGFloatType() const {
+  auto *decl = getCGFloatDecl();
+  if (!decl)
+    return Type();
+
+  return decl->getDeclaredInterfaceType();
+}
 
 static ConcreteDeclRef getCGFloatOrDoubleInitDecl(
     ASTContext &ctx, Type fromType, Type toType) {
@@ -3297,15 +3328,15 @@ ASTContext::getNormalConformance(Type conformingType,
   NormalProtocolConformance::Profile(id, protocol, dc);
 
   // Did we already record the normal conformance?
-  void *insertPos;
+  llvm::FoldingSetInsertToken insertToken;
   auto &normalConformances = getImpl().NormalConformances;
-  if (auto result = normalConformances.FindNodeOrInsertPos(id, insertPos))
+  if (auto result = normalConformances.lookup(id, insertToken))
     return result;
 
   // Build a new normal protocol conformance.
   auto result = new (*this) NormalProtocolConformance(
       conformingType, protocol, loc, inheritedTypeRepr, dc, state, options);
-  normalConformances.InsertNode(result, insertPos);
+  normalConformances.insert(result, insertToken);
 
   return result;
 }
@@ -3371,9 +3402,9 @@ ASTContext::getSpecializedConformance(Type type,
   AllocationArena arena = getArena(type->getRecursiveProperties());
 
   // Did we already record the specialized conformance?
-  void *insertPos;
+  llvm::FoldingSetInsertToken insertToken;
   auto &specializedConformances = getImpl().getArena(arena).SpecializedConformances;
-  if (auto result = specializedConformances.FindNodeOrInsertPos(id, insertPos))
+  if (auto result = specializedConformances.lookup(id, insertToken))
     return result;
 
   // Vanishing tuple conformances must be handled by the caller.
@@ -3387,10 +3418,10 @@ ASTContext::getSpecializedConformance(Type type,
   auto result
     = new (*this, arena) SpecializedProtocolConformance(type, generic,
                                                         substitutions);
-  auto node = specializedConformances.FindNodeOrInsertPos(id, insertPos);
+  auto node = specializedConformances.lookup(id, insertToken);
   (void)node;
   assert(!node);
-  specializedConformances.InsertNode(result, insertPos);
+  specializedConformances.insert(result, insertToken);
   return result;
 }
 
@@ -3420,15 +3451,14 @@ ASTContext::getInheritedConformance(Type type, ProtocolConformance *inherited) {
   AllocationArena arena = getArena(type->getRecursiveProperties());
 
   // Did we already record the inherited protocol conformance?
-  void *insertPos;
+  llvm::FoldingSetInsertToken insertToken;
   auto &inheritedConformances = getImpl().getArena(arena).InheritedConformances;
-  if (auto result
-        = inheritedConformances.FindNodeOrInsertPos(id, insertPos))
+  if (auto result = inheritedConformances.lookup(id, insertToken))
     return result;
 
   // Build a new inherited protocol conformance.
   auto result = new (*this, arena) InheritedProtocolConformance(type, inherited);
-  inheritedConformances.InsertNode(result, insertPos);
+  inheritedConformances.insert(result, insertToken);
   return result;
 }
 
@@ -3454,9 +3484,9 @@ PackConformance *PackConformance::get(PackType *conformingType,
   AllocationArena arena = getArena(properties);
 
   // Did we already record the pack conformance?
-  void *insertPos;
+  llvm::FoldingSetInsertToken insertToken;
   auto &packConformances = ctx.getImpl().getArena(arena).PackConformances;
-  if (auto result = packConformances.FindNodeOrInsertPos(id, insertPos))
+  if (auto result = packConformances.lookup(id, insertToken))
     return result;
 
   // Build a new pack conformance.
@@ -3466,10 +3496,10 @@ PackConformance *PackConformance::get(PackType *conformingType,
   auto result
     = new (mem) PackConformance(conformingType, protocol,
                                 conformances);
-  auto node = packConformances.FindNodeOrInsertPos(id, insertPos);
+  auto node = packConformances.lookup(id, insertToken);
   (void)node;
   assert(!node);
-  packConformances.InsertNode(result, insertPos);
+  packConformances.insert(result, insertToken);
 
   return result;
 }
@@ -3889,9 +3919,9 @@ TypeAliasType *TypeAliasType::get(TypeAliasDecl *typealias, Type parent,
   TypeAliasType::Profile(id, typealias, parent, genericArgs, underlying);
 
   // Did we already record this type?
-  void *insertPos;
+  llvm::FoldingSetInsertToken insertToken;
   auto &types = ctx.getImpl().getArena(arena).TypeAliasTypes;
-  if (auto result = types.FindNodeOrInsertPos(id, insertPos))
+  if (auto result = types.lookup(id, insertToken))
     return result;
 
   // Build a new type.
@@ -3899,7 +3929,7 @@ TypeAliasType *TypeAliasType::get(TypeAliasDecl *typealias, Type parent,
   auto mem = ctx.Allocate(size, alignof(TypeAliasType), arena);
   auto result = new (mem) TypeAliasType(typealias, parent, genericArgs,
                                         underlying, properties);
-  types.InsertNode(result, insertPos);
+  types.insert(result, insertToken);
   return result;
 }
 
@@ -3939,14 +3969,14 @@ LocatableType *LocatableType::get(SourceLoc loc, Type underlying) {
   LocatableType::Profile(id, loc, underlying);
 
   // Did we already record this type?
-  void *insertPos;
+  llvm::FoldingSetInsertToken insertToken;
   auto &types = ctx.getImpl().getArena(arena).LocatableTypes;
-  if (auto result = types.FindNodeOrInsertPos(id, insertPos))
+  if (auto result = types.lookup(id, insertToken))
     return result;
 
   // Build a new type.
   auto result = new (ctx, arena) LocatableType(loc, underlying, properties);
-  types.InsertNode(result, insertPos);
+  types.insert(result, insertToken);
   return result;
 }
 
@@ -4016,11 +4046,11 @@ Type ErrorUnionType::get(const ASTContext &ctx, ArrayRef<Type> terms) {
 
   // Check whether we've seen this type before.
   auto arena = getArena(properties);
-  void *insertPos = nullptr;
+  llvm::FoldingSetInsertToken insertToken;
   llvm::FoldingSetNodeID id;
   ErrorUnionType::Profile(id, terms);
-  if (auto knownTy = ctx.getImpl().getArena(arena).ErrorUnionTypes
-          .FindNodeOrInsertPos(id, insertPos))
+  if (auto knownTy =
+          ctx.getImpl().getArena(arena).ErrorUnionTypes.lookup(id, insertToken))
     return knownTy;
 
   // Use trailing objects for term storage.
@@ -4028,7 +4058,7 @@ Type ErrorUnionType::get(const ASTContext &ctx, ArrayRef<Type> terms) {
   auto mem = ctx.Allocate(size, alignof(ErrorUnionType), arena);
   auto unionTy = new (mem) ErrorUnionType(isCanonical ? &ctx : nullptr,
                                           terms, properties);
-  ctx.getImpl().getArena(arena).ErrorUnionTypes.InsertNode(unionTy, insertPos);
+  ctx.getImpl().getArena(arena).ErrorUnionTypes.insert(unionTy, insertToken);
   return unionTy;
 }
 
@@ -4070,8 +4100,8 @@ IntegerType *IntegerType::get(StringRef value, bool isNegative,
   llvm::FoldingSetNodeID id;
   IntegerType::Profile(id, value, isNegative);
 
-  void *insertPos;
-  if (auto intType = ctx.getImpl().IntegerTypes.FindNodeOrInsertPos(id, insertPos)) {
+  llvm::FoldingSetInsertToken insertToken;
+  if (auto intType = ctx.getImpl().IntegerTypes.lookup(id, insertToken)) {
     return intType;
   }
 
@@ -4080,7 +4110,7 @@ IntegerType *IntegerType::get(StringRef value, bool isNegative,
   auto intType = new (ctx, AllocationArena::Permanent)
       IntegerType(strCopy, isNegative, ctx);
 
-  ctx.getImpl().IntegerTypes.InsertNode(intType, insertPos);
+  ctx.getImpl().IntegerTypes.insert(intType, insertToken);
   return intType;
 }
 
@@ -4091,9 +4121,8 @@ HiddenType *HiddenType::get(const ASTContext &ctx, StringRef mangledName,
   llvm::FoldingSetNodeID id;
   HiddenType::Profile(id, mangledName, definingModule, layoutInfoDecl, parent);
 
-  void *insertPos;
-  if (auto *hidden =
-          ctx.getImpl().HiddenTypes.FindNodeOrInsertPos(id, insertPos)) {
+  llvm::FoldingSetInsertToken insertToken;
+  if (auto *hidden = ctx.getImpl().HiddenTypes.lookup(id, insertToken)) {
     return hidden;
   }
 
@@ -4102,7 +4131,7 @@ HiddenType *HiddenType::get(const ASTContext &ctx, StringRef mangledName,
   auto *hidden = new (ctx, AllocationArena::Permanent)
       HiddenType(nameCopy, definingModule, layoutInfoDecl, parent, ctx);
 
-  ctx.getImpl().HiddenTypes.InsertNode(hidden, insertPos);
+  ctx.getImpl().HiddenTypes.insert(hidden, insertToken);
   return hidden;
 }
 
@@ -4162,16 +4191,16 @@ BuiltinFixedArrayType *BuiltinFixedArrayType::get(CanType Size,
   BuiltinFixedArrayType::Profile(id, Size, ElementType);
   auto &ctx = Size->getASTContext();
 
-  void *insertPos;
-  if (BuiltinFixedArrayType *faTy
-        = ctx.getImpl().getArena(arena).BuiltinFixedArrayTypes
-                 .FindNodeOrInsertPos(id, insertPos))
+  llvm::FoldingSetInsertToken insertToken;
+  if (BuiltinFixedArrayType *faTy =
+          ctx.getImpl().getArena(arena).BuiltinFixedArrayTypes.lookup(
+              id, insertToken))
     return faTy;
 
   BuiltinFixedArrayType *faTy
     = new (ctx, arena) BuiltinFixedArrayType(Size, ElementType, properties);
-  ctx.getImpl().getArena(arena).BuiltinFixedArrayTypes
-      .InsertNode(faTy, insertPos);
+  ctx.getImpl().getArena(arena).BuiltinFixedArrayTypes.insert(faTy,
+                                                              insertToken);
   return faTy;
 }
 
@@ -4185,16 +4214,15 @@ CanBuiltinBorrowType BuiltinBorrowType::get(CanType Referent) {
   BuiltinBorrowType::Profile(id, Referent);
   auto &ctx = Referent->getASTContext();
 
-  void *insertPos;
-  if (BuiltinBorrowType *faTy
-        = ctx.getImpl().getArena(arena).BuiltinBorrowTypes
-                 .FindNodeOrInsertPos(id, insertPos))
+  llvm::FoldingSetInsertToken insertToken;
+  if (BuiltinBorrowType *faTy =
+          ctx.getImpl().getArena(arena).BuiltinBorrowTypes.lookup(id,
+                                                                  insertToken))
     return CanBuiltinBorrowType(faTy);
 
   BuiltinBorrowType *faTy
     = new (ctx, arena) BuiltinBorrowType(Referent, properties);
-  ctx.getImpl().getArena(arena).BuiltinBorrowTypes
-      .InsertNode(faTy, insertPos);
+  ctx.getImpl().getArena(arena).BuiltinBorrowTypes.insert(faTy, insertToken);
   return CanBuiltinBorrowType(faTy);
 }
 
@@ -4204,16 +4232,16 @@ BuiltinVectorType *BuiltinVectorType::get(const ASTContext &context,
   llvm::FoldingSetNodeID id;
   BuiltinVectorType::Profile(id, elementType, numElements);
 
-  void *insertPos;
-  if (BuiltinVectorType *vecType
-        = context.getImpl().BuiltinVectorTypes.FindNodeOrInsertPos(id, insertPos))
+  llvm::FoldingSetInsertToken insertToken;
+  if (BuiltinVectorType *vecType =
+          context.getImpl().BuiltinVectorTypes.lookup(id, insertToken))
     return vecType;
 
   assert(elementType->isCanonical() && "Non-canonical builtin vector?");
   BuiltinVectorType *vecTy
     = new (context, AllocationArena::Permanent)
        BuiltinVectorType(context, elementType, numElements);
-  context.getImpl().BuiltinVectorTypes.InsertNode(vecTy, insertPos);
+  context.getImpl().BuiltinVectorTypes.insert(vecTy, insertToken);
   return vecTy;
 }
 
@@ -4259,13 +4287,13 @@ TupleType *TupleType::get(ArrayRef<TupleTypeElt> Fields, const ASTContext &C) {
 
   auto arena = getArena(properties);
 
-  void *InsertPos = nullptr;
+  llvm::FoldingSetInsertToken InsertToken;
   // Check to see if we've already seen this tuple before.
   llvm::FoldingSetNodeID ID;
   TupleType::Profile(ID, Fields);
 
-  if (TupleType *TT
-        = C.getImpl().getArena(arena).TupleTypes.FindNodeOrInsertPos(ID,InsertPos))
+  if (TupleType *TT =
+          C.getImpl().getArena(arena).TupleTypes.lookup(ID, InsertToken))
     return TT;
 
   bool IsCanonical = true;   // All canonical elts means this is canonical.
@@ -4281,7 +4309,7 @@ TupleType *TupleType::get(ArrayRef<TupleTypeElt> Fields, const ASTContext &C) {
   void *mem = C.Allocate(bytes, alignof(TupleType), arena);
   auto New = new (mem) TupleType(Fields, IsCanonical ? &C : nullptr,
                                  properties);
-  C.getImpl().getArena(arena).TupleTypes.InsertNode(New, InsertPos);
+  C.getImpl().getArena(arena).TupleTypes.insert(New, InsertToken);
   return New;
 }
 
@@ -4317,10 +4345,10 @@ PackExpansionType *PackExpansionType::get(Type patternType, Type countType) {
   llvm::FoldingSetNodeID id;
   PackExpansionType::Profile(id, patternType, countType);
 
-  void *insertPos;
+  llvm::FoldingSetInsertToken insertToken;
   if (PackExpansionType *expType =
-        context.getImpl().getArena(arena)
-          .PackExpansionTypes.FindNodeOrInsertPos(id, insertPos))
+          context.getImpl().getArena(arena).PackExpansionTypes.lookup(
+              id, insertToken))
     return expType;
 
   // The canonical pack expansion type uses the canonical shape.
@@ -4340,8 +4368,8 @@ PackExpansionType *PackExpansionType::get(Type patternType, Type countType) {
   PackExpansionType *expansionType =
       new (context, arena) PackExpansionType(patternType, countType, properties,
                                              canCtx);
-  context.getImpl().getArena(arena).PackExpansionTypes.InsertNode(expansionType,
-                                                                  insertPos);
+  context.getImpl().getArena(arena).PackExpansionTypes.insert(expansionType,
+                                                              insertToken);
   return expansionType;
 }
 
@@ -4375,10 +4403,10 @@ PackElementType *PackElementType::get(Type packType, unsigned level) {
   llvm::FoldingSetNodeID id;
   PackElementType::Profile(id, packType, level);
 
-  void *insertPos;
+  llvm::FoldingSetInsertToken insertToken;
   if (PackElementType *elementType =
-        context.getImpl().getArena(arena)
-          .PackElementTypes.FindNodeOrInsertPos(id, insertPos))
+          context.getImpl().getArena(arena).PackElementTypes.lookup(
+              id, insertToken))
     return elementType;
 
   const ASTContext *canCtx = packType->isCanonical()
@@ -4386,8 +4414,8 @@ PackElementType *PackElementType::get(Type packType, unsigned level) {
   PackElementType *elementType =
       new (context, arena) PackElementType(packType, level, properties,
                                            canCtx);
-  context.getImpl().getArena(arena).PackElementTypes.InsertNode(elementType,
-                                                                insertPos);
+  context.getImpl().getArena(arena).PackElementTypes.insert(elementType,
+                                                            insertToken);
   return elementType;
 }
 
@@ -4432,13 +4460,13 @@ PackType *PackType::get(const ASTContext &C, ArrayRef<Type> elements) {
 
   auto arena = getArena(properties);
 
-  void *InsertPos = nullptr;
+  llvm::FoldingSetInsertToken InsertToken;
   // Check to see if we've already seen this pack before.
   llvm::FoldingSetNodeID ID;
   PackType::Profile(ID, elements);
 
-  if (PackType *TT
-        = C.getImpl().getArena(arena).PackTypes.FindNodeOrInsertPos(ID,InsertPos))
+  if (PackType *TT =
+          C.getImpl().getArena(arena).PackTypes.lookup(ID, InsertToken))
     return TT;
 
   size_t bytes = totalSizeToAlloc<Type>(elements.size());
@@ -4446,7 +4474,7 @@ PackType *PackType::get(const ASTContext &C, ArrayRef<Type> elements) {
   void *mem = C.Allocate(bytes, alignof(PackType), arena);
   auto New =
       new (mem) PackType(elements, isCanonical ? &C : nullptr, properties);
-  C.getImpl().getArena(arena).PackTypes.InsertNode(New, InsertPos);
+  C.getImpl().getArena(arena).PackTypes.insert(New, InsertToken);
   return New;
 }
 
@@ -4468,19 +4496,18 @@ CanSILPackType SILPackType::get(const ASTContext &C, ExtInfo info,
   assert(getArena(properties) == AllocationArena::Permanent &&
          "SILPackType has elements requiring temporary allocation?");
 
-  void *insertPos = nullptr;
+  llvm::FoldingSetInsertToken insertToken;
   // Check to see if we've already seen this pack before.
   llvm::FoldingSetNodeID ID;
   SILPackType::Profile(ID, info, elements);
 
-  if (SILPackType *existing
-        = C.getImpl().SILPackTypes.FindNodeOrInsertPos(ID, insertPos))
+  if (SILPackType *existing = C.getImpl().SILPackTypes.lookup(ID, insertToken))
     return CanSILPackType(existing);
 
   size_t bytes = totalSizeToAlloc<CanType>(elements.size());
   void *mem = C.Allocate(bytes, alignof(SILPackType));
   auto builtType = new (mem) SILPackType(C, properties, info, elements);
-  C.getImpl().SILPackTypes.InsertNode(builtType, insertPos);
+  C.getImpl().SILPackTypes.insert(builtType, insertToken);
   return CanSILPackType(builtType);
 }
 
@@ -4684,7 +4711,7 @@ UnboundGenericType *UnboundGenericType::
 get(GenericTypeDecl *TheDecl, Type Parent, const ASTContext &C) {
   llvm::FoldingSetNodeID ID;
   UnboundGenericType::Profile(ID, TheDecl, Parent);
-  void *InsertPos = nullptr;
+  llvm::FoldingSetInsertToken InsertToken;
   RecursiveTypeProperties properties;
   if (TheDecl->getExplicitSafety() == ExplicitSafety::Unsafe)
     properties |= RecursiveTypeProperties::IsUnsafe;
@@ -4692,13 +4719,13 @@ get(GenericTypeDecl *TheDecl, Type Parent, const ASTContext &C) {
 
   auto arena = getArena(properties);
 
-  if (auto unbound = C.getImpl().getArena(arena).UnboundGenericTypes
-                        .FindNodeOrInsertPos(ID, InsertPos))
+  if (auto unbound = C.getImpl().getArena(arena).UnboundGenericTypes.lookup(
+          ID, InsertToken))
     return unbound;
 
   auto result = new (C, arena) UnboundGenericType(TheDecl, Parent, C,
                                                   properties);
-  C.getImpl().getArena(arena).UnboundGenericTypes.InsertNode(result, InsertPos);
+  C.getImpl().getArena(arena).UnboundGenericTypes.insert(result, InsertToken);
   return result;
 }
 
@@ -4749,10 +4776,9 @@ BoundGenericType *BoundGenericType::get(NominalTypeDecl *TheDecl,
 
   auto arena = getArena(properties);
 
-  void *InsertPos = nullptr;
+  llvm::FoldingSetInsertToken InsertToken;
   if (BoundGenericType *BGT =
-        C.getImpl().getArena(arena).BoundGenericTypes.FindNodeOrInsertPos(ID,
-                                                                     InsertPos))
+          C.getImpl().getArena(arena).BoundGenericTypes.lookup(ID, InsertToken))
     return BGT;
 
   bool IsCanonical = !Parent || Parent->isCanonical();
@@ -4784,7 +4810,7 @@ BoundGenericType *BoundGenericType::get(NominalTypeDecl *TheDecl,
   } else {
     llvm_unreachable("Unhandled NominalTypeDecl");
   }
-  C.getImpl().getArena(arena).BoundGenericTypes.InsertNode(newType, InsertPos);
+  C.getImpl().getArena(arena).BoundGenericTypes.insert(newType, InsertToken);
 
   return newType;
 }
@@ -4878,7 +4904,7 @@ ProtocolCompositionType::build(const ASTContext &C, ArrayRef<Type> Members,
   assert(Members.size() != 1 || HasExplicitAnyObject || !Inverses.empty());
 
   // Check to see if we've already seen this protocol composition before.
-  void *InsertPos = nullptr;
+  llvm::FoldingSetInsertToken InsertToken;
   llvm::FoldingSetNodeID ID;
   ProtocolCompositionType::Profile(ID, Members, Inverses, HasExplicitAnyObject);
 
@@ -4893,9 +4919,8 @@ ProtocolCompositionType::build(const ASTContext &C, ArrayRef<Type> Members,
   // Create a new protocol composition type.
   auto arena = getArena(properties);
 
-  if (auto compTy
-      = C.getImpl().getArena(arena).ProtocolCompositionTypes
-          .FindNodeOrInsertPos(ID, InsertPos))
+  if (auto compTy = C.getImpl().getArena(arena).ProtocolCompositionTypes.lookup(
+          ID, InsertToken))
     return compTy;
 
   // Use trailing objects for member type storage
@@ -4906,8 +4931,8 @@ ProtocolCompositionType::build(const ASTContext &C, ArrayRef<Type> Members,
                                                   Inverses,
                                                   HasExplicitAnyObject,
                                                   properties);
-  C.getImpl().getArena(arena).ProtocolCompositionTypes.InsertNode(
-      compTy, InsertPos);
+  C.getImpl().getArena(arena).ProtocolCompositionTypes.insert(compTy,
+                                                              InsertToken);
   return compTy;
 }
 
@@ -4925,13 +4950,13 @@ ParameterizedProtocolType *ParameterizedProtocolType::get(const ASTContext &C,
 
   auto arena = getArena(properties);
 
-  void *InsertPos = nullptr;
+  llvm::FoldingSetInsertToken InsertToken;
   llvm::FoldingSetNodeID ID;
   ParameterizedProtocolType::Profile(ID, baseTy, args);
 
-  if (auto paramTy
-      = C.getImpl().getArena(arena).ParameterizedProtocolTypes
-          .FindNodeOrInsertPos(ID, InsertPos))
+  if (auto paramTy =
+          C.getImpl().getArena(arena).ParameterizedProtocolTypes.lookup(
+              ID, InsertToken))
     return paramTy;
 
   auto size = totalSizeToAlloc<Type>(args.size());
@@ -4941,8 +4966,8 @@ ParameterizedProtocolType *ParameterizedProtocolType::get(const ASTContext &C,
 
   auto paramTy = new (mem) ParameterizedProtocolType(
         isCanonical ? &C : nullptr, baseTy, args, properties);
-  C.getImpl().getArena(arena).ParameterizedProtocolTypes.InsertNode(
-      paramTy, InsertPos);
+  C.getImpl().getArena(arena).ParameterizedProtocolTypes.insert(paramTy,
+                                                                InsertToken);
   return paramTy;
 }
 
@@ -5093,12 +5118,15 @@ DynamicSelfType *DynamicSelfType::get(Type selfType, const ASTContext &ctx) {
 
 static RecursiveTypeProperties
 getFunctionRecursiveProperties(ArrayRef<AnyFunctionType::Param> params,
+                               ArrayRef<AnyFunctionType::Yield> yields,
                                Type result, Type globalActor, Type thrownError,
                                Type sendableDependentType,
-                               Type calledOnceDependentType) {
+                               Type executionSemanticsDependentType) {
   RecursiveTypeProperties properties;
   for (auto param : params)
     properties |= param.getPlainType()->getRecursiveProperties();
+  for (auto yield : yields)
+    properties |= yield.getType()->getRecursiveProperties();
   properties |= result->getRecursiveProperties();
   if (globalActor)
     properties |= globalActor->getRecursiveProperties();
@@ -5109,8 +5137,8 @@ getFunctionRecursiveProperties(ArrayRef<AnyFunctionType::Param> params,
     properties |= RecursiveTypeProperties::SolverAllocated;
     properties |= RecursiveTypeProperties::HasTypeVariable;
   }
-  if (calledOnceDependentType) {
-    ASSERT(calledOnceDependentType->hasTypeVariable());
+  if (executionSemanticsDependentType) {
+    ASSERT(executionSemanticsDependentType->hasTypeVariable());
     properties |= RecursiveTypeProperties::SolverAllocated;
     properties |= RecursiveTypeProperties::HasTypeVariable;
   }
@@ -5118,9 +5146,9 @@ getFunctionRecursiveProperties(ArrayRef<AnyFunctionType::Param> params,
   return properties;
 }
 
-static bool
-isAnyFunctionTypeCanonical(ArrayRef<AnyFunctionType::Param> params,
-                        Type result) {
+static bool isAnyFunctionTypeCanonical(ArrayRef<AnyFunctionType::Param> params,
+                                       ArrayRef<AnyFunctionType::Yield> yields,
+                                       Type result) {
   for (auto param : params) {
     if (!param.getPlainType()->isCanonical())
       return false;
@@ -5128,6 +5156,11 @@ isAnyFunctionTypeCanonical(ArrayRef<AnyFunctionType::Param> params,
       // Canonical types don't have internal labels
       return false;
     }
+  }
+
+  for (auto yield : yields) {
+    if (!yield.getType()->isCanonical())
+      return false;
   }
 
   return result->isCanonical();
@@ -5140,6 +5173,7 @@ isAnyFunctionTypeCanonical(ArrayRef<AnyFunctionType::Param> params,
 // rather than opt-in.
 static RecursiveTypeProperties
 getGenericFunctionRecursiveProperties(ArrayRef<AnyFunctionType::Param> params,
+                                      ArrayRef<AnyFunctionType::Yield> yields,
                                       Type result, Type globalActor,
                                       Type thrownError) {
   static_assert(RecursiveTypeProperties::BitWidth == 19,
@@ -5158,6 +5192,8 @@ getGenericFunctionRecursiveProperties(ArrayRef<AnyFunctionType::Param> params,
 
   for (auto param : params)
     unionBits(param.getPlainType());
+  for (auto yield : yields)
+    unionBits(yield.getType());
 
   if (result->getRecursiveProperties().hasDynamicSelf())
     properties |= RecursiveTypeProperties::HasDynamicSelf;
@@ -5168,10 +5204,9 @@ getGenericFunctionRecursiveProperties(ArrayRef<AnyFunctionType::Param> params,
   return properties;
 }
 
-static bool
-isGenericFunctionTypeCanonical(GenericSignature sig,
-                               ArrayRef<AnyFunctionType::Param> params,
-                               Type result) {
+static bool isGenericFunctionTypeCanonical(
+    GenericSignature sig, ArrayRef<AnyFunctionType::Param> params,
+    ArrayRef<AnyFunctionType::Yield> yields, Type result) {
   if (!sig->isCanonical())
     return false;
 
@@ -5184,16 +5219,21 @@ isGenericFunctionTypeCanonical(GenericSignature sig,
     }
   }
 
+  for (auto yield : yields) {
+    if (!sig->isReducedType(yield.getType()))
+      return false;
+  }
+
   return sig->isReducedType(result);
 }
 
 AnyFunctionType *AnyFunctionType::withExtInfo(ExtInfo info) const {
   if (isa<FunctionType>(this))
-    return FunctionType::get(getParams(), getResult(), info);
+    return FunctionType::get(getParams(), getYields(), getResult(), info);
 
   auto *genFnTy = cast<GenericFunctionType>(this);
-  return GenericFunctionType::get(genFnTy->getGenericSignature(),
-                                  getParams(), getResult(), info);
+  return GenericFunctionType::get(genFnTy->getGenericSignature(), getParams(),
+                                  getYields(), getResult(), info);
 }
 
 Type AnyFunctionType::Param::getParameterType(bool forCanonical,
@@ -5212,6 +5252,29 @@ Type AnyFunctionType::Param::getParameterType(bool forCanonical,
       type = VariadicSequenceType::get(type);
   }
   return type;
+}
+
+bool AnyFunctionType::canComposeTuple(ArrayRef<Param> params) {
+  if (params.size() == 1)
+    return false;
+
+  for (auto &param : params) {
+    // We generally cannot handle parameter flags, though we can carve out an
+    // exception for ownership flags such as __owned, which we can thunk, and
+    // flags that can freely dropped from a function type such as
+    // @_nonEphemeral. Note that @noDerivative can also be freely dropped, as
+    // we've already ensured that the destination function is not
+    // @differentiable.
+    auto flags = param.getParameterFlags();
+    flags = flags.withOwnershipSpecifier(
+        param.isInOut() ? ParamSpecifier::InOut : ParamSpecifier::Default);
+    flags = flags.withNonEphemeral(false)
+                 .withNoDerivative(false);
+    if (!flags.isNone())
+      return false;
+  }
+
+  return true;
 }
 
 Type AnyFunctionType::composeTuple(ASTContext &ctx, ArrayRef<Param> params,
@@ -5268,6 +5331,20 @@ void AnyFunctionType::relabelParams(MutableArrayRef<Param> params,
   }
 }
 
+bool AnyFunctionType::equalYields(ArrayRef<AnyFunctionType::Yield> a,
+                                  ArrayRef<AnyFunctionType::Yield> b) {
+  if (a.size() != b.size())
+    return false;
+
+  for (unsigned i = 0, n = a.size(); i != n; ++i) {
+    if (a[i] != b[i])
+      return false;
+  }
+
+  return true;
+}
+
+
 /// Profile \p params into \p ID. In contrast to \c == on \c Param, the profile
 /// *does* take the internal label into account and *does not* canonicalize
 /// the param's type.
@@ -5282,10 +5359,21 @@ static void profileParams(llvm::FoldingSetNodeID &ID,
   }
 }
 
+static void profileYields(llvm::FoldingSetNodeID &ID,
+                          ArrayRef<AnyFunctionType::Yield> yields) {
+  ID.AddInteger(yields.size());
+  for (auto yield : yields) {
+    ID.AddPointer(yield.getType().getPointer());
+    ID.AddInteger(yield.getFlags().toRaw());
+  }
+}
+
 void FunctionType::Profile(llvm::FoldingSetNodeID &ID,
-                           ArrayRef<AnyFunctionType::Param> params, Type result,
+                           ArrayRef<AnyFunctionType::Param> params,
+                           ArrayRef<AnyFunctionType::Yield> yields, Type result,
                            std::optional<ExtInfo> info) {
   profileParams(ID, params);
+  profileYields(ID, yields);
   ID.AddPointer(result.getPointer());
   if (info.has_value()) {
     info->Profile(ID);
@@ -5293,21 +5381,24 @@ void FunctionType::Profile(llvm::FoldingSetNodeID &ID,
 }
 
 FunctionType *FunctionType::get(ArrayRef<AnyFunctionType::Param> params,
+                                ArrayRef<AnyFunctionType::Yield> yields,
                                 Type result, std::optional<ExtInfo> info) {
+  assert(yields.size() > 0 == (info.has_value() && info.value().isCoroutine()));
   Type thrownError;
   Type globalActor;
   Type sendableDependentType;
-  Type calledOnceDependentType;
+  Type executionSemanticsDependentType;
   if (info.has_value()) {
     thrownError = info->getThrownError();
     globalActor = info->getGlobalActor();
     sendableDependentType = info->getSendableDependentType();
-    calledOnceDependentType = info->getCalledOnceDependentType();
+    executionSemanticsDependentType =
+        info->getExecutionSemanticsDependentType();
   }
 
   auto properties = getFunctionRecursiveProperties(
-      params, result, globalActor, thrownError, sendableDependentType,
-      calledOnceDependentType);
+      params, yields, result, globalActor, thrownError, sendableDependentType,
+      executionSemanticsDependentType);
   auto arena = getArena(properties);
 
   if (info.has_value()) {
@@ -5321,14 +5412,14 @@ FunctionType *FunctionType::get(ArrayRef<AnyFunctionType::Param> params,
   }
 
   llvm::FoldingSetNodeID id;
-  FunctionType::Profile(id, params, result, info);
+  FunctionType::Profile(id, params, yields, result, info);
 
   const ASTContext &ctx = result->getASTContext();
 
   // Do we already have this generic function type?
-  void *insertPos;
+  llvm::FoldingSetInsertToken insertToken;
   if (auto funcTy =
-        ctx.getImpl().getArena(arena).FunctionTypes.FindNodeOrInsertPos(id, insertPos)) {
+          ctx.getImpl().getArena(arena).FunctionTypes.lookup(id, insertToken)) {
     return funcTy;
   }
 
@@ -5341,21 +5432,22 @@ FunctionType *FunctionType::get(ArrayRef<AnyFunctionType::Param> params,
 
   unsigned numTypes = (globalActor ? 1 : 0) + (thrownError ? 1 : 0) +
                       (sendableDependentType ? 1 : 0) +
-                      (calledOnceDependentType ? 1 : 0);
+                      (executionSemanticsDependentType ? 1 : 0);
 
   bool hasLifetimeDependenceInfo =
       info.has_value() ? !info->getLifetimeDependencies().empty() : false;
   auto numLifetimeDependencies =
       hasLifetimeDependenceInfo ? info->getLifetimeDependencies().size() : 0;
-  size_t allocSize = totalSizeToAlloc<AnyFunctionType::Param, ClangTypeInfo,
-                                      Type, size_t, LifetimeDependenceInfo>(
-      params.size(), hasClangInfo ? 1 : 0, numTypes,
-      hasLifetimeDependenceInfo ? 1 : 0,
-      hasLifetimeDependenceInfo ? numLifetimeDependencies : 0);
+  size_t allocSize =
+      totalSizeToAlloc<AnyFunctionType::Param, AnyFunctionType::Yield,
+                       ClangTypeInfo, Type, size_t, LifetimeDependenceInfo>(
+          params.size(), yields.size(), hasClangInfo ? 1 : 0, numTypes,
+          hasLifetimeDependenceInfo ? 1 : 0,
+          hasLifetimeDependenceInfo ? numLifetimeDependencies : 0);
 
   void *mem = ctx.Allocate(allocSize, alignof(FunctionType), arena);
 
-  bool isCanonical = isAnyFunctionTypeCanonical(params, result);
+  bool isCanonical = isAnyFunctionTypeCanonical(params, yields, result);
   if (!clangTypeInfo.empty()) {
     if (ctx.LangOpts.UseClangFunctionTypes)
       isCanonical &= clangTypeInfo.getType()->isCanonicalUnqualified();
@@ -5372,10 +5464,9 @@ FunctionType *FunctionType::get(ArrayRef<AnyFunctionType::Param> params,
   if (globalActor && !globalActor->isCanonical())
     isCanonical = false;
 
-  auto funcTy = new (mem) FunctionType(params, result, info,
-                                       isCanonical ? &ctx : nullptr,
-                                       properties);
-  ctx.getImpl().getArena(arena).FunctionTypes.InsertNode(funcTy, insertPos);
+  auto funcTy = new (mem) FunctionType(
+      params, yields, result, info, isCanonical ? &ctx : nullptr, properties);
+  ctx.getImpl().getArena(arena).FunctionTypes.insert(funcTy, insertToken);
   return funcTy;
 }
 
@@ -5389,13 +5480,16 @@ isConsistentAboutIsolation(const std::optional<ASTExtInfo> &info,
 #endif
 
 // If the input and result types are canonical, then so is the result.
-FunctionType::FunctionType(ArrayRef<AnyFunctionType::Param> params, Type output,
+FunctionType::FunctionType(ArrayRef<AnyFunctionType::Param> params,
+                           ArrayRef<AnyFunctionType::Yield> yields, Type output,
                            std::optional<ExtInfo> info, const ASTContext *ctx,
                            RecursiveTypeProperties properties)
     : AnyFunctionType(TypeKind::Function, ctx, output, properties,
-                      params.size(), info) {
+                      params.size(), yields.size(), info) {
   std::uninitialized_copy(params.begin(), params.end(),
                           getTrailingObjects<AnyFunctionType::Param>());
+  std::uninitialized_copy(yields.begin(), yields.end(),
+                          getTrailingObjects<AnyFunctionType::Yield>());
   assert(isConsistentAboutIsolation(info, params));
   if (info.has_value()) {
     auto clangTypeInfo = info.value().getClangTypeInfo();
@@ -5414,8 +5508,9 @@ FunctionType::FunctionType(ArrayRef<AnyFunctionType::Param> params, Type output,
       getTrailingObjects<Type>()[typeIdx] = sendableDependentType;
       typeIdx += 1;
     }
-    if (Type calledOnceDependentType = info->getCalledOnceDependentType()) {
-      getTrailingObjects<Type>()[typeIdx] = calledOnceDependentType;
+    if (Type executionSemanticsDependentType =
+            info->getExecutionSemanticsDependentType()) {
+      getTrailingObjects<Type>()[typeIdx] = executionSemanticsDependentType;
       typeIdx += 1;
     }
     auto lifetimeDependenceInfo = info->getLifetimeDependencies();
@@ -5431,9 +5526,11 @@ FunctionType::FunctionType(ArrayRef<AnyFunctionType::Param> params, Type output,
 void GenericFunctionType::Profile(llvm::FoldingSetNodeID &ID,
                                   GenericSignature sig,
                                   ArrayRef<AnyFunctionType::Param> params,
+                                  ArrayRef<AnyFunctionType::Yield> yields,
                                   Type result, std::optional<ExtInfo> info) {
   ID.AddPointer(sig.getPointer());
   profileParams(ID, params);
+  profileYields(ID, yields);
   ID.AddPointer(result.getPointer());
   if (info.has_value()) {
     info->Profile(ID);
@@ -5442,6 +5539,7 @@ void GenericFunctionType::Profile(llvm::FoldingSetNodeID &ID,
 
 GenericFunctionType *GenericFunctionType::get(GenericSignature sig,
                                               ArrayRef<Param> params,
+                                              ArrayRef<Yield> yields,
                                               Type result,
                                               std::optional<ExtInfo> info) {
   assert(sig && "no generic signature for generic function type?!");
@@ -5453,16 +5551,17 @@ GenericFunctionType *GenericFunctionType::get(GenericSignature sig,
     return param.getPlainType()->hasTypeVariable();
   }));
   assert(!result->hasTypeVariable());
+  assert(yields.size() > 0 == (info.has_value() && info.value().isCoroutine()));
 
   llvm::FoldingSetNodeID id;
-  GenericFunctionType::Profile(id, sig, params, result, info);
+  GenericFunctionType::Profile(id, sig, params, yields, result, info);
 
   const ASTContext &ctx = result->getASTContext();
 
   // Do we already have this generic function type?
-  void *insertPos;
-  if (auto result
-        = ctx.getImpl().GenericFunctionTypes.FindNodeOrInsertPos(id, insertPos)) {
+  llvm::FoldingSetInsertToken insertToken;
+  if (auto result =
+          ctx.getImpl().GenericFunctionTypes.lookup(id, insertToken)) {
     return result;
   }
 
@@ -5470,13 +5569,14 @@ GenericFunctionType *GenericFunctionType::get(GenericSignature sig,
   // it's canonical.  Unfortunately, isReducedType() can cause
   // new GenericFunctionTypes to be created and thus invalidate our insertion
   // point.
-  bool isCanonical = isGenericFunctionTypeCanonical(sig, params, result);
+  bool isCanonical =
+      isGenericFunctionTypeCanonical(sig, params, yields, result);
 
   assert((!info.has_value() || info.value().getClangTypeInfo().empty()) &&
          "Generic functions do not have Clang types at the moment.");
 
-  if (auto funcTy
-        = ctx.getImpl().GenericFunctionTypes.FindNodeOrInsertPos(id, insertPos)) {
+  if (auto funcTy =
+          ctx.getImpl().GenericFunctionTypes.lookup(id, insertToken)) {
     return funcTy;
   }
 
@@ -5486,10 +5586,10 @@ GenericFunctionType *GenericFunctionType::get(GenericSignature sig,
     thrownError = info->getThrownError();
     globalActor = info->getGlobalActor();
 
-    // Generic functions can't currently have Sendable or @called(once)
+    // Generic functions can't currently have Sendable or @called(atMostOnce)
     // dependence.
     ASSERT(!info->getSendableDependentType());
-    ASSERT(!info->getCalledOnceDependentType());
+    ASSERT(!info->getExecutionSemanticsDependentType());
   }
 
   if (thrownError) {
@@ -5512,31 +5612,36 @@ GenericFunctionType *GenericFunctionType::get(GenericSignature sig,
   auto numLifetimeDependencies =
       hasLifetimeDependenceInfo ? info->getLifetimeDependencies().size() : 0;
 
-  size_t allocSize = totalSizeToAlloc<AnyFunctionType::Param, Type, size_t,
-                                      LifetimeDependenceInfo>(
-      params.size(), numTypes, hasLifetimeDependenceInfo ? 1 : 0,
-      hasLifetimeDependenceInfo ? numLifetimeDependencies : 0);
+  size_t allocSize =
+      totalSizeToAlloc<AnyFunctionType::Param, AnyFunctionType::Yield, Type,
+                       size_t, LifetimeDependenceInfo>(
+          params.size(), yields.size(), numTypes,
+          hasLifetimeDependenceInfo ? 1 : 0,
+          hasLifetimeDependenceInfo ? numLifetimeDependencies : 0);
   void *mem = ctx.Allocate(allocSize, alignof(GenericFunctionType));
 
   auto properties = getGenericFunctionRecursiveProperties(
-      params, result, globalActor, thrownError);
-  auto funcTy = new (mem) GenericFunctionType(sig, params, result, info,
-                                              isCanonical ? &ctx : nullptr,
-                                              properties);
+      params, yields, result, globalActor, thrownError);
+  auto funcTy =
+      new (mem) GenericFunctionType(sig, params, yields, result, info,
+                                    isCanonical ? &ctx : nullptr, properties);
 
-  ctx.getImpl().GenericFunctionTypes.InsertNode(funcTy, insertPos);
+  ctx.getImpl().GenericFunctionTypes.insert(funcTy, insertToken);
   return funcTy;
 }
 
 GenericFunctionType::GenericFunctionType(
-    GenericSignature sig, ArrayRef<AnyFunctionType::Param> params, Type result,
+    GenericSignature sig, ArrayRef<AnyFunctionType::Param> params,
+    ArrayRef<AnyFunctionType::Yield> yields, Type result,
     std::optional<ExtInfo> info, const ASTContext *ctx,
     RecursiveTypeProperties properties)
     : AnyFunctionType(TypeKind::GenericFunction, ctx, result, properties,
-                      params.size(), info),
+                      params.size(), yields.size(), info),
       Signature(sig) {
   std::uninitialized_copy(params.begin(), params.end(),
                           getTrailingObjects<AnyFunctionType::Param>());
+  std::uninitialized_copy(yields.begin(), yields.end(),
+                          getTrailingObjects<AnyFunctionType::Yield>());
   assert(isConsistentAboutIsolation(info, params));
   if (info) {
     unsigned thrownErrorIndex = 0;
@@ -5566,8 +5671,8 @@ GenericTypeParamType *GenericTypeParamType::get(Identifier name,
   GenericTypeParamType::Profile(id, paramKind, depth, index, /*weight=*/0,
                                 valueType, name);
 
-  void *insertPos;
-  if (auto gpTy = ctx.getImpl().GenericParamTypes.FindNodeOrInsertPos(id, insertPos))
+  llvm::FoldingSetInsertToken insertToken;
+  if (auto gpTy = ctx.getImpl().GenericParamTypes.lookup(id, insertToken))
     return gpTy;
 
   RecursiveTypeProperties props = RecursiveTypeProperties::HasTypeParameter;
@@ -5579,7 +5684,7 @@ GenericTypeParamType *GenericTypeParamType::get(Identifier name,
 
   auto result = new (ctx, AllocationArena::Permanent)
       GenericTypeParamType(name, canType, ctx);
-  ctx.getImpl().GenericParamTypes.InsertNode(result, insertPos);
+  ctx.getImpl().GenericParamTypes.insert(result, insertToken);
   return result;
 }
 
@@ -5600,8 +5705,8 @@ GenericTypeParamType *GenericTypeParamType::get(GenericTypeParamKind paramKind,
   GenericTypeParamType::Profile(id, paramKind, depth, index, weight, valueType,
                                 Identifier());
 
-  void *insertPos;
-  if (auto gpTy = ctx.getImpl().GenericParamTypes.FindNodeOrInsertPos(id, insertPos))
+  llvm::FoldingSetInsertToken insertToken;
+  if (auto gpTy = ctx.getImpl().GenericParamTypes.lookup(id, insertToken))
     return gpTy;
 
   RecursiveTypeProperties props = RecursiveTypeProperties::HasTypeParameter;
@@ -5610,7 +5715,7 @@ GenericTypeParamType *GenericTypeParamType::get(GenericTypeParamKind paramKind,
 
   auto result = new (ctx, AllocationArena::Permanent)
       GenericTypeParamType(paramKind, depth, index, weight, valueType, props, ctx);
-  ctx.getImpl().GenericParamTypes.InsertNode(result, insertPos);
+  ctx.getImpl().GenericParamTypes.insert(result, insertToken);
   return result;
 }
 
@@ -5953,9 +6058,8 @@ CanSILFunctionType SILFunctionType::get(
                            patternSubs, invocationSubs);
 
   // Do we already have this generic function type?
-  void *insertPos;
-  if (auto result
-        = ctx.getImpl().SILFunctionTypes.FindNodeOrInsertPos(id, insertPos))
+  llvm::FoldingSetInsertToken insertToken;
+  if (auto result = ctx.getImpl().SILFunctionTypes.lookup(id, insertToken))
     return CanSILFunctionType(result);
 
   // All SILFunctionTypes are canonical.
@@ -6002,7 +6106,7 @@ CanSILFunctionType SILFunctionType::get(
                                 ctx, properties, witnessMethodConformance);
   assert(fnType->hasResultCache() == hasResultCache);
 
-  ctx.getImpl().SILFunctionTypes.InsertNode(fnType, insertPos);
+  ctx.getImpl().SILFunctionTypes.insert(fnType, insertToken);
   return CanSILFunctionType(fnType);
 }
 
@@ -6313,9 +6417,9 @@ SubstitutionMap::Storage *SubstitutionMap::Storage::get(
 
   // Did we already record this substitution map?
   auto &ctx = genericSig->getASTContext();
-  void *insertPos;
+  llvm::FoldingSetInsertToken insertToken;
   auto &substitutionMaps = ctx.getImpl().getArena(arena).SubstitutionMaps;
-  if (auto result = substitutionMaps.FindNodeOrInsertPos(id, insertPos))
+  if (auto result = substitutionMaps.lookup(id, insertToken))
     return result;
 
   // Allocate the appropriate amount of storage for the signature and its
@@ -6326,7 +6430,7 @@ SubstitutionMap::Storage *SubstitutionMap::Storage::get(
   auto mem = ctx.Allocate(size, alignof(Storage), arena);
 
   auto result = new (mem) Storage(genericSig, replacementTypes, conformances);
-  substitutionMaps.InsertNode(result, insertPos);
+  substitutionMaps.insert(result, insertToken);
   return result;
 }
 
@@ -6364,17 +6468,17 @@ ProtocolConformanceRef ProtocolConformanceRef::forAbstract(
   AbstractConformance::Profile(id, conformingType, proto);
 
   // Did we already record this abstract conformance?
-  void *insertPos;
+  llvm::FoldingSetInsertToken insertToken;
   auto &abstractConformances =
       ctx.getImpl().getArena(arena).AbstractConformances;
-  if (auto result = abstractConformances.FindNodeOrInsertPos(id, insertPos))
+  if (auto result = abstractConformances.lookup(id, insertToken))
     return ProtocolConformanceRef(result);
 
   // Allocate and record this abstract conformance.
   auto mem = ctx.Allocate(sizeof(AbstractConformance),
                           alignof(AbstractConformance), arena);
   auto result = new (mem) AbstractConformance(conformingType, proto);
-  abstractConformances.InsertNode(result, insertPos);
+  abstractConformances.insert(result, insertToken);
   return ProtocolConformanceRef(result);
 }
 
@@ -6386,8 +6490,8 @@ const AvailabilityContext::Storage *AvailabilityContext::Storage::get(
                                         domainInfos);
 
   auto &foldingSet = ctx.getImpl().AvailabilityContexts;
-  void *insertPos;
-  auto *existing = foldingSet.FindNodeOrInsertPos(id, insertPos);
+  llvm::FoldingSetInsertToken insertToken;
+  auto *existing = foldingSet.lookup(id, insertToken);
   if (existing)
     return existing;
 
@@ -6399,7 +6503,7 @@ const AvailabilityContext::Storage *AvailabilityContext::Storage::get(
       platformRange, isDeprecated, domainInfos.size());
   std::uninitialized_copy(domainInfos.begin(), domainInfos.end(),
                           newNode->getTrailingObjects());
-  foldingSet.InsertNode(newNode, insertPos);
+  foldingSet.insert(newNode, insertToken);
 
   return newNode;
 }
@@ -6413,8 +6517,8 @@ CustomAvailabilityDomain::get(StringRef name, Kind kind, ModuleDecl *mod,
   CustomAvailabilityDomain::Profile(id, identifier, mod);
 
   auto &foldingSet = ctx.getImpl().CustomAvailabilityDomains;
-  void *insertPos;
-  auto *existing = foldingSet.FindNodeOrInsertPos(id, insertPos);
+  llvm::FoldingSetInsertToken insertToken;
+  auto *existing = foldingSet.lookup(id, insertToken);
   if (existing)
     return existing;
 
@@ -6422,7 +6526,7 @@ CustomAvailabilityDomain::get(StringRef name, Kind kind, ModuleDecl *mod,
                            alignof(CustomAvailabilityDomain));
   auto *newNode = ::new (mem)
       CustomAvailabilityDomain(identifier, kind, mod, decl, predicateFunc);
-  foldingSet.InsertNode(newNode, insertPos);
+  foldingSet.insert(newNode, insertToken);
 
   return newNode;
 }
@@ -6463,9 +6567,9 @@ GenericSignature::get(ArrayRef<GenericTypeParamType *> params,
   GenericSignatureImpl::Profile(ID, params, requirements);
 
   auto &ctx = getASTContext(params, requirements);
-  void *insertPos;
+  llvm::FoldingSetInsertToken insertToken;
   auto &sigs = ctx.getImpl().GenericSignatures;
-  if (auto *sig = sigs.FindNodeOrInsertPos(ID, insertPos)) {
+  if (auto *sig = sigs.lookup(ID, insertToken)) {
     if (isKnownCanonical)
       sig->CanonicalSignatureOrASTContext = &ctx;
 
@@ -6480,7 +6584,7 @@ GenericSignature::get(ArrayRef<GenericTypeParamType *> params,
   void *mem = ctx.Allocate(bytes, alignof(GenericSignatureImpl));
   auto *newSig =
       new (mem) GenericSignatureImpl(params, requirements, isKnownCanonical);
-  ctx.getImpl().GenericSignatures.InsertNode(newSig, insertPos);
+  ctx.getImpl().GenericSignatures.insert(newSig, insertToken);
   return newSig;
 }
 
@@ -6680,9 +6784,9 @@ void DeclName::initialize(ASTContext &C, DeclBaseName baseName,
   llvm::FoldingSetNodeID id;
   CompoundDeclName::Profile(id, baseName, argumentNames);
 
-  void *insert = nullptr;
-  if (CompoundDeclName *compoundName
-        = C.getImpl().CompoundNames.FindNodeOrInsertPos(id, insert)) {
+  llvm::FoldingSetInsertToken insertToken;
+  if (CompoundDeclName *compoundName =
+          C.getImpl().CompoundNames.lookup(id, insertToken)) {
     BaseNameOrCompound = compoundName;
     return;
   }
@@ -6694,7 +6798,7 @@ void DeclName::initialize(ASTContext &C, DeclBaseName baseName,
   std::uninitialized_copy(argumentNames.begin(), argumentNames.end(),
                           compoundName->getArgumentNames().begin());
   BaseNameOrCompound = compoundName;
-  C.getImpl().CompoundNames.InsertNode(compoundName, insert);
+  C.getImpl().CompoundNames.insert(compoundName, insertToken);
 }
 
 /// Build a compound value name given a base name and a set of argument names
@@ -6727,9 +6831,9 @@ void DeclNameRef::initialize(ASTContext &C, Identifier moduleSelector,
   llvm::FoldingSetNodeID id;
   SelectiveDeclNameRef::Profile(id, moduleSelector, fullName);
 
-  void *insert = nullptr;
-  if (SelectiveDeclNameRef *selectiveRef
-        = C.getImpl().SelectiveNameRefs.FindNodeOrInsertPos(id, insert)) {
+  llvm::FoldingSetInsertToken insertToken;
+  if (SelectiveDeclNameRef *selectiveRef =
+          C.getImpl().SelectiveNameRefs.lookup(id, insertToken)) {
     storage = selectiveRef;
     return;
   }
@@ -6738,7 +6842,7 @@ void DeclNameRef::initialize(ASTContext &C, Identifier moduleSelector,
                         alignof(SelectiveDeclNameRef));
   auto selectiveRef = new (buf) SelectiveDeclNameRef(moduleSelector, fullName);
   storage = selectiveRef;
-  C.getImpl().SelectiveNameRefs.InsertNode(selectiveRef, insert);
+  C.getImpl().SelectiveNameRefs.insert(selectiveRef, insertToken);
 }
 
 /// Find the implementation of the named type in the given module.
@@ -7409,10 +7513,10 @@ SILLayout *SILLayout::get(ASTContext &C,
   Profile(id, Generics, Fields, CapturesGenericEnvironment);
 
   // Return an existing layout if there is one.
-  void *insertPos;
+  llvm::FoldingSetInsertToken insertToken;
   auto &Layouts = C.getImpl().SILLayouts;
 
-  if (auto existing = Layouts.FindNodeOrInsertPos(id, insertPos))
+  if (auto existing = Layouts.lookup(id, insertToken))
     return existing;
 
   // Allocate a new layout.
@@ -7421,7 +7525,7 @@ SILLayout *SILLayout::get(ASTContext &C,
 
   auto newLayout = ::new (memory) SILLayout(Generics, Fields,
                                             CapturesGenericEnvironment);
-  Layouts.InsertNode(newLayout, insertPos);
+  Layouts.insert(newLayout, insertToken);
   return newLayout;
 }
 
@@ -7447,16 +7551,16 @@ CanSILBoxType SILBoxType::get(ASTContext &C,
   Substitutions = Substitutions.getCanonical();
 
   // Return an existing layout if there is one.
-  void *insertPos;
+  llvm::FoldingSetInsertToken insertToken;
   auto &SILBoxTypes = C.getImpl().SILBoxTypes;
   llvm::FoldingSetNodeID id;
   Profile(id, Layout, Substitutions);
-  if (auto existing = SILBoxTypes.FindNodeOrInsertPos(id, insertPos))
+  if (auto existing = SILBoxTypes.lookup(id, insertToken))
     return CanSILBoxType(existing);
 
   auto newBox = new (C, AllocationArena::Permanent) SILBoxType(C, Layout,
                                                                Substitutions);
-  SILBoxTypes.InsertNode(newBox, insertPos);
+  SILBoxTypes.insert(newBox, insertToken);
   return CanSILBoxType(newBox);
 }
 
@@ -7514,10 +7618,11 @@ LayoutConstraint LayoutConstraint::getLayoutConstraint(LayoutConstraintKind Kind
   llvm::FoldingSetNodeID ID;
   LayoutConstraintInfo::Profile(ID, Kind, SizeInBits, Alignment);
 
-  void *InsertPos = nullptr;
+  llvm::FoldingSetInsertToken InsertToken;
   if (LayoutConstraintInfo *Layout =
-          C.getImpl().getArena(AllocationArena::Permanent)
-              .LayoutConstraints.FindNodeOrInsertPos(ID, InsertPos))
+          C.getImpl()
+              .getArena(AllocationArena::Permanent)
+              .LayoutConstraints.lookup(ID, InsertToken))
     return LayoutConstraint(Layout);
 
   LayoutConstraintInfo *New =
@@ -7525,8 +7630,9 @@ LayoutConstraint LayoutConstraint::getLayoutConstraint(LayoutConstraintKind Kind
           ? new (C, AllocationArena::Permanent)
                 LayoutConstraintInfo(Kind, SizeInBits, Alignment)
           : new (C, AllocationArena::Permanent) LayoutConstraintInfo(Kind);
-  C.getImpl().getArena(AllocationArena::Permanent)
-      .LayoutConstraints.InsertNode(New, InsertPos);
+  C.getImpl()
+      .getArena(AllocationArena::Permanent)
+      .LayoutConstraints.insert(New, InsertToken);
   return LayoutConstraint(New);
 }
 
@@ -7629,8 +7735,8 @@ IndexSubset::get(ASTContext &ctx, const SmallBitVector &indices) {
   id.AddInteger(capacity);
   for (unsigned index : indices.set_bits())
     id.AddInteger(index);
-  void *insertPos = nullptr;
-  auto *existing = foldingSet.FindNodeOrInsertPos(id, insertPos);
+  llvm::FoldingSetInsertToken insertToken;
+  auto *existing = foldingSet.lookup(id, insertToken);
   if (existing)
     return existing;
   auto sizeToAlloc = sizeof(IndexSubset) +
@@ -7638,7 +7744,7 @@ IndexSubset::get(ASTContext &ctx, const SmallBitVector &indices) {
   auto *buf = reinterpret_cast<IndexSubset *>(
       ctx.Allocate(sizeToAlloc, alignof(IndexSubset)));
   auto *newNode = new (buf) IndexSubset(indices);
-  foldingSet.InsertNode(newNode, insertPos);
+  foldingSet.insert(newNode, insertToken);
   return newNode;
 }
 
@@ -7653,8 +7759,8 @@ AutoDiffDerivativeFunctionIdentifier *AutoDiffDerivativeFunctionIdentifier::get(
   auto derivativeCanGenSig = derivativeGenericSignature.getCanonicalSignature();
   id.AddPointer(derivativeCanGenSig.getPointer());
 
-  void *insertPos;
-  auto *existing = foldingSet.FindNodeOrInsertPos(id, insertPos);
+  llvm::FoldingSetInsertToken insertToken;
+  auto *existing = foldingSet.lookup(id, insertToken);
   if (existing)
     return existing;
 
@@ -7662,7 +7768,7 @@ AutoDiffDerivativeFunctionIdentifier *AutoDiffDerivativeFunctionIdentifier::get(
                          alignof(AutoDiffDerivativeFunctionIdentifier));
   auto *newNode = ::new (mem) AutoDiffDerivativeFunctionIdentifier(
       kind, parameterIndices, derivativeGenericSignature);
-  foldingSet.InsertNode(newNode, insertPos);
+  foldingSet.insert(newNode, insertToken);
 
   return newNode;
 }

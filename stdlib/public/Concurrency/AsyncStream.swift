@@ -257,7 +257,6 @@ public struct AsyncStream<Element> {
   }
 
   let context: _Context
-  
 
   /// Constructs an asynchronous stream for an element type, using the
   /// specified buffering policy and element-producing closure.
@@ -365,8 +364,12 @@ public struct AsyncStream<Element> {
         }
         return result
       } onCancel: {
-        storage.value = nil
-        onCancel?()
+        // This handler also runs immediately for every next() on an
+        // already-cancelled task; call `onCancel` at most once, and not at all
+        // if the stream already finished.
+        if storage.take() != nil {
+          onCancel?()
+        }
       }
     }
   }

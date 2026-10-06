@@ -741,6 +741,7 @@ extension _AsyncStreamStorage {
   }
 }
 
+// this is used to store closures; which are two words
 final class _AsyncStreamCriticalStorage<Contents>: @unchecked Sendable {
   var _value: Contents
   private init(_doNotCallMe: ()) {
@@ -774,6 +775,16 @@ final class _AsyncStreamCriticalStorage<Contents>: @unchecked Sendable {
         unlock()
       }
     }
+  }
+
+  /// Atomically replaces the contents with `nil` and returns the previous
+  /// contents. At most one caller observes a non-`nil` value.
+  func take<Wrapped>() -> Contents where Contents == Wrapped? {
+    lock()
+    let contents = _value
+    _value = nil
+    unlock()
+    return contents
   }
 
   static func create(_ initial: Contents) -> _AsyncStreamCriticalStorage {

@@ -349,7 +349,7 @@ public struct AsyncThrowingStream<Element, Failure: Error> {
     context = _Context(storage: storage, produce: storage.next)
     build(Continuation(storage: storage))
   }
-
+  
   /// Constructs an asynchronous throwing stream from a given element-producing
   /// closure.
   ///

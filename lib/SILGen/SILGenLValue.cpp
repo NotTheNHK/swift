@@ -43,7 +43,6 @@
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILUndef.h"
 #include "swift/SIL/TypeLowering.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
 using namespace swift;
 using namespace Lowering;
@@ -1246,7 +1245,7 @@ namespace {
           // handle delayed initialization of the boxes and convert those to
           // initable_but_not_consumable.
           //
-          // `@called(once)` values are always consumed by whatever uses
+          // `@called(atMostOnce)` values are always consumed by whatever uses
           // them, so a non-read access to one must permit consuming it,
           // unlike an ordinary noncopyable var/let box, which only permits
           // being fully reassigned.
@@ -1255,7 +1254,7 @@ namespace {
               isReadAccess(getAccessKind())
                   ? MarkUnresolvedNonCopyableValueInst::CheckKind::
                         NoConsumeOrAssign
-              : Value.getType().isCalledOnce()
+              : Value.getType().hasCalledAtMostOnceSemantics()
                   ? MarkUnresolvedNonCopyableValueInst::CheckKind::
                         ConsumableAndAssignable
                   : MarkUnresolvedNonCopyableValueInst::CheckKind::
@@ -3596,6 +3595,23 @@ namespace {
         FormalRValueType(formalRValueType), AccessKind(accessKind) {}
 
     void emitUsingStrategy(AccessStrategy strategy) {
+      // Foreign COM interfaces provide getters and setters, not Swift
+      // coroutine accessors. Materialize read-write accesses through them.
+      if (AccessKind == SGFAccessKind::ReadWrite &&
+          strategy.getKind() == AccessStrategy::DispatchToAccessor) {
+        auto *protocol = dyn_cast<ProtocolDecl>(Storage->getDeclContext());
+        if (protocol && protocol->isCOMInterface()) {
+          Type selfType = protocol->getSelfInterfaceType().subst(Subs);
+          if (selfType->is<ExistentialArchetypeType>()) {
+            strategy = AccessStrategy::getMaterializeToTemporary(
+                AccessStrategy::getAccessor(AccessorKind::Get,
+                                            /*dispatched=*/true),
+                AccessStrategy::getAccessor(AccessorKind::Set,
+                                            /*dispatched=*/true));
+          }
+        }
+      }
+
       switch (strategy.getKind()) {
       case AccessStrategy::Storage: {
         auto typeData =
@@ -4989,6 +5005,17 @@ LValue SILGenLValue::visitLoadExpr(LoadExpr *e, SGFAccessKind accessKind,
 
 LValue SILGenLValue::visitConsumeExpr(ConsumeExpr *e, SGFAccessKind accessKind,
                                       LValueOptions options) {
+
+  // When using lifetime resolution, the consume expr just overrides the access
+  // kind under which we visit the sub expression.
+  if (SGF.getASTContext().SILOpts.EnableLifetimeResolution) {
+    auto loweredTy = SGF.getLoweredType(e->getSubExpr()->getType());
+    auto consumingAccess = loweredTy.isAddress()
+                               ? SGFAccessKind::OwnedAddressConsume
+                               : SGFAccessKind::OwnedObjectConsume;
+    return visitRec(e->getSubExpr(), consumingAccess, options);
+  }
+
   // Do formal evaluation of the base l-value.
   LValue baseLV = visitRec(e->getSubExpr(), SGFAccessKind::ReadWrite,
                            options.forComputedBaseLValue());

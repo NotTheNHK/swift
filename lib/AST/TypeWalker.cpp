@@ -18,7 +18,6 @@
 #include "swift/AST/TypeVisitor.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/Types.h"
-#include "swift/Basic/Assertions.h"
 
 using namespace swift;
 
@@ -132,8 +131,8 @@ class Traversal : public TypeVisitor<Traversal, bool>
         return true;
     }
 
-    if (auto calledOnceDep = ty->getCalledOnceDependentType()) {
-      if (doIt(calledOnceDep))
+    if (auto executionSemanticsDep = ty->getExecutionSemanticsDependentType()) {
+      if (doIt(executionSemanticsDep))
         return true;
     }
 

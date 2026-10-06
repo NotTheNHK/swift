@@ -31,9 +31,7 @@
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/Type.h"
-#include "swift/AST/TypeVisitor.h"
 #include "swift/AST/Types.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/LLVM.h"
 
 #include "clang/AST/ASTContext.h"
@@ -92,6 +90,14 @@ getClangBuiltinTypeFromKind(const clang::ASTContext &context,
   case clang::BuiltinType::Id:                                                 \
     return context.SingletonId;
 #include "clang/Basic/HLSLIntangibleTypes.def"
+#define HLSL_PACKED_TYPE(Name, Id, SingletonId)                                \
+  case clang::BuiltinType::Id:                                                 \
+    return context.SingletonId;
+#include "clang/Basic/HLSLPackedTypes.def"
+#define SPIRV_TYPE(Name, Id, SingletonId)                                      \
+  case clang::BuiltinType::Id:                                                 \
+    return context.SingletonId;
+#include "clang/Basic/SPIRVTypes.def"
   }
 
   // Not a valid BuiltinType.
@@ -870,6 +876,12 @@ clang::QualType ClangTypeConverter::convert(Type type) {
   auto it = Cache.find(type);
   if (it != Cache.end())
     return it->second;
+
+  if (type->hasCCompatibleForeignReferenceRepresentation()) {
+    auto result = ClangASTContext.VoidPtrTy;
+    Cache.insert({type, result});
+    return result;
+  }
 
   if (auto existential = type->getAs<ExistentialType>())
     type = existential->getConstraintType();
