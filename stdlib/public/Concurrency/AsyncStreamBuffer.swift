@@ -547,7 +547,7 @@ extension _AsyncStreamStorage.StateMachine {
 
     case .waiting(var waiting):
       switch terminationReason {
-      case .finished(let failure) where waiting.consumers.isEmpty:
+      case .finished(let failure) where unsafe waiting.consumers.isEmpty:
         unsafe self = .init(state: .terminated(.init(
           failure: failure
         )))
