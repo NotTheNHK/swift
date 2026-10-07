@@ -287,14 +287,18 @@ internal final class _AsyncStreamStorage<
 extension _AsyncStreamStorage.StateMachine {
   enum BufferingNewestDecision {
     case append
+
     case dropOldestValue
+
     case dropNewValue
 
     init(bufferCount: Int, limit: Int) {
       if bufferCount < limit && limit > .zero {
         self = .append
+
       } else if bufferCount >= limit && limit > .zero {
         self = .dropOldestValue
+
       } else {
         self = .dropNewValue
       }
@@ -546,19 +550,10 @@ extension _AsyncStreamStorage.StateMachine {
       )
 
     case .waiting(var waiting):
-      switch terminationReason {
-      case .finished(let failure) where unsafe waiting.consumers.isEmpty:
-        unsafe self = .init(state: .terminated(.init(
-          failure: failure
-        )))
-
-      default:
-        unsafe self = .init(state: .terminating(.init(
-          consumers: waiting.consumers,
-          terminationReason: terminationReason
-        )))
-      }
-
+      unsafe self = .init(state: .terminating(.init(
+        consumers: waiting.consumers,
+        terminationReason: terminationReason
+      )))
       return unsafe .finalize(
         terminationHandler: waiting.terminationHandler.take()
       )
@@ -695,31 +690,29 @@ extension _AsyncStreamStorage {
   }
 
   func terminate(_ terminationReason: Continuation.Termination) {
-    let action = withLock { state in
+    let terminateAction = withLock { state in
       return state.terminate(terminationReason)
     }
 
-    switch consume action {
-    case .finalize(let terminationHandler):
-      terminationHandler?.invoke(terminationReason)
+    guard
+      case .finalize(let terminationHandler) = consume terminateAction
+    else { return }
 
-      let finalizeAction = withLock { state in
-        return unsafe state.finalize()
+    terminationHandler?.invoke(terminationReason)
+
+    let finalizeAction = withLock { state in
+      return unsafe state.finalize()
+    }
+
+    switch unsafe consume finalizeAction {
+    case .resume(var consumers, let failure):
+      if let failure {
+        let consumer = unsafe consumers.removeFirst()
+        unsafe consumer.resume(returning: .failure(failure))
       }
 
-      switch unsafe consume finalizeAction {
-      case .resume(var consumers, let failure):
-        if let failure {
-          let consumer = unsafe consumers.removeFirst()
-          unsafe consumer.resume(returning: .failure(failure))
-        }
-
-        while let consumer = unsafe consumers.popFirst() {
-          unsafe consumer.resume(returning: .success(nil))
-        }
-
-      case .none:
-        return
+      while let consumer = unsafe consumers.popFirst() {
+        unsafe consumer.resume(returning: .success(nil))
       }
 
     case .none:
