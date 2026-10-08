@@ -56,23 +56,23 @@ func _unlock(_ ptr: UnsafeRawPointer)
 ///
 /// States:
 ///
-///   - `idle`:  The stream is active with **no consumers present**,
-///      and may accept new elements (depending on the `BufferingPolicy`).
-///   - `waiting`: The stream is active with **at least one consumer present**,
-///      and new elements are directly delivered to the next consumer.
-///   - `draining`: The stream accepts **no new elements**,
-///      consumers drain the buffer, which **initially contains at least one element**.
-///   - `terminating`: The stream accepts **no new elements**,
-///      consumers are enqueued, and may initially contain zero consumers.
-///   - `terminated`: The stream accepts **no new elements**,
-///      **consumers are not enqueued** and resumed immediately.
+///   - `idle`: The stream buffers new elements depending on its `BufferingPolicy`.
+///   **The buffer can be empty.**
+///   - `waiting`: The stream queues suspended consumers.
+///   **The queue is never empty.**
+///   - `draining`:  New consumers drain the buffer. **The stream rejects new elements.**
+///   **The buffer starts with at least one element.**
+///   - `terminating`: New consumers are queued. **The stream rejects new elements.**
+///   **The queue can be empty.**
+///   - `terminated`: **The stream rejects new elements.**
+///   **New consumers are resumed immediately.**
 ///
 /// Transitions:
 ///
 /// ```text
 /// Current State   Possible Next State
 /// -------------   -------------------
-/// idle          ->  idle, waiting, draining, terminating
+/// idle          ->  idle, waiting, draining, terminating, terminated
 /// waiting       ->  idle, waiting, terminating
 /// draining      ->  draining, terminating, terminated
 /// terminating   ->  terminating, terminated
