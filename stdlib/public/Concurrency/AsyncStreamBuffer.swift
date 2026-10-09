@@ -58,11 +58,11 @@ func _unlock(_ ptr: UnsafeRawPointer)
 ///
 ///   - `idle`: The stream buffers new elements depending on its `BufferingPolicy`.
 ///   **The buffer can be empty.**
-///   - `waiting`: The stream queues new consumers.
+///   - `waiting`: The stream enqueues new consumers.
 ///   **The queue is never empty.**
 ///   - `draining`:  New consumers drain the buffer. **The stream rejects new elements.**
 ///   **The buffer starts with at least one element.**
-///   - `terminating`: New consumers are queued. **The stream rejects new elements.**
+///   - `terminating`: New consumers are enqueued. **The stream rejects new elements.**
 ///   **The queue can be empty.**
 ///   - `terminated`: **The stream rejects new elements.**
 ///   **New consumers are resumed immediately.**
@@ -100,33 +100,16 @@ func _unlock(_ ptr: UnsafeRawPointer)
 ///
 /// Concurrent Behavior:
 ///
-/// The state machine is single-consumer–base,
-/// yielded elements are, at most once, deliverd to a singel consumer.
-/// However, on concurrent iteration, consumers are enqueued
-/// in a **FIFO queue** and **eventually resumed**.
-///
-/// `onTermination` Behavior:
-///
-/// Every state permits assigning a new closure to the `onTermination` property,
-/// including `.terminated`. However, regardless of whether `onTermination` is `nil`
-/// once the stream has been terminated, it is impossible to invoke `onTermination` again.
+/// The state machine delivers each yielded element to only a **single consumer;**
+/// during concurrent iteration, it enqueues new consumers in a **FIFO queue** and
+/// **eventually resumes** them.
 ///
 /// Finishing Behavior:
 ///
-/// A throwing stream that has been **terminated due to cancellation is unfinished**,
-/// and can be **finished once** with a specific error
-/// by calling the `finish(throwing:)` method.
-///
-/// Specifically, an unfinished terminal stream is itself a transient state
-/// during the finalization process. If no call to `finish()` / `finish(throwing:)`
-/// occurs during finalization, e.g., from within `onTermination`,
-/// the stream will be **automatically finished** after `onTermination`
-/// was invoked.
-///
-/// - Note: While the same mechanism applies to `AsyncStream`,
-/// since it is non-throwing, whether the termination reason is cancellation
-/// or the stream being finished makes no difference: a terminal `AsyncStream`
-/// that has drained all its buffered elements will always return `nil`.
+/// A stream **terminated due to cancellation is unfinished**,
+/// and can be **finished once during finalization** by calling one of the `finish` methods.
+/// If no such call occurs during finalization (e.g., in `onTermination`),
+/// the stream is **finished automatically** after `onTermination` returns.
 @safe
 internal final class _AsyncStreamStorage<
   Element, Failure: Error, PublicTermination
