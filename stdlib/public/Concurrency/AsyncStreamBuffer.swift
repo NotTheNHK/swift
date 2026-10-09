@@ -58,7 +58,7 @@ func _unlock(_ ptr: UnsafeRawPointer)
 ///
 ///   - `idle`: The stream buffers new elements depending on its `BufferingPolicy`.
 ///   **The buffer can be empty.**
-///   - `waiting`: The stream queues suspended consumers.
+///   - `waiting`: The stream queues new consumers.
 ///   **The queue is never empty.**
 ///   - `draining`:  New consumers drain the buffer. **The stream rejects new elements.**
 ///   **The buffer starts with at least one element.**
@@ -82,20 +82,20 @@ func _unlock(_ ptr: UnsafeRawPointer)
 /// Actions:
 ///
 /// - `YieldAction`:
-///   - `resume`:  The next consumer is resumed with the newly yielded value.
+///   - `resume`:  The oldest queued consumer is resumed with the newly yielded value.
 ///   - `none`:  No action is taken.
 ///
 /// - `NextAction`:
-///   - `resume`: The new consumer is resumed.
+///   - `resume`: The new consumer is resumed with the oldest buffered element or `nil`.
 ///   - `throw`: The new consumer is resumed by throwing an error of type `Failure`.
-///   - `suspend`:  The new consumer is enqueued. No action is taken.
+///   - `none`:  No action is taken.
 ///
 /// - `TerminateAction`:
 ///   - `finalize`: The `TerminationHandler` and `finalize()` are invoked.
 ///   - `none`: No action is taken.
 ///
 /// - `FinalizeAction`:
-///   - `resume`: All suspended consumers are resumed.
+///   - `resume`: All queued consumers are resumed.
 ///   - `none`: No action is taken.
 ///
 /// Concurrent Behavior:
@@ -230,7 +230,7 @@ internal final class _AsyncStreamStorage<
         failure: Failure
       )
 
-      case suspend
+      case none
     }
 
     enum TerminateAction: ~Copyable {
@@ -457,7 +457,7 @@ extension _AsyncStreamStorage.StateMachine {
           bufferingPolicy: idle.bufferingPolicy,
           terminationHandler: idle.terminationHandler.take()
         )))
-        return unsafe .suspend
+        return unsafe .none
 
       } else {
         let element = idle.buffer.removeFirst()
@@ -471,7 +471,7 @@ extension _AsyncStreamStorage.StateMachine {
     case .waiting(var waiting):
       unsafe waiting.consumers.append(consumer)
       unsafe self = .init(state: .waiting(waiting))
-      return unsafe .suspend
+      return unsafe .none
 
     case .draining(var draining):
       let element = draining.buffer.removeFirst()
@@ -502,7 +502,7 @@ extension _AsyncStreamStorage.StateMachine {
     case .terminating(var terminating):
       unsafe terminating.consumers.append(consumer)
       unsafe self = .init(state: .terminating(terminating))
-      return unsafe .suspend
+      return unsafe .none
 
     case .terminated(let terminated):
       unsafe self = .init(state: .terminated(.init()))
@@ -674,7 +674,7 @@ extension _AsyncStreamStorage {
     case .throw(let consumer, let failure):
       unsafe consumer.resume(returning: .failure(failure))
 
-    case .suspend:
+    case .none:
       return
     }
   }
