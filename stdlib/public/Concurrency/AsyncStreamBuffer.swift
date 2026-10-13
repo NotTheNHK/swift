@@ -56,23 +56,23 @@ func _unlock(_ ptr: UnsafeRawPointer)
 ///
 /// States:
 ///
-///   - `idle`:  The stream is active with **no consumers present**,
-///      and may accept new elements (depending on the `BufferingPolicy`).
-///   - `waiting`: The stream is active with **at least one consumer present**,
-///      and new elements are directly delivered to the next consumer.
-///   - `draining`: The stream accepts **no new elements**,
-///      consumers drain the buffer, which **initially contains at least one element**.
-///   - `terminating`: The stream accepts **no new elements**,
-///      consumers are enqueued, and may initially contain zero consumers.
-///   - `terminated`: The stream accepts **no new elements**,
-///      **consumers are not enqueued** and resumed immediately.
+///   - `idle`: The stream buffers new elements depending on its `BufferingPolicy`.
+///   **The buffer can be empty.**
+///   - `waiting`: The stream enqueues new consumers.
+///   **The queue is never empty.**
+///   - `draining`:  New consumers drain the buffer. **The stream rejects new elements.**
+///   **The buffer starts with at least one element.**
+///   - `terminating`: New consumers are enqueued. **The stream rejects new elements.**
+///   **The queue can be empty.**
+///   - `terminated`: **The stream rejects new elements.**
+///   **New consumers are resumed immediately.**
 ///
 /// Transitions:
 ///
 /// ```text
 /// Current State   Possible Next State
 /// -------------   -------------------
-/// idle          ->  idle, waiting, draining, terminating
+/// idle          ->  idle, waiting, draining, terminating, terminated
 /// waiting       ->  idle, waiting, terminating
 /// draining      ->  draining, terminating, terminated
 /// terminating   ->  terminating, terminated
@@ -82,51 +82,34 @@ func _unlock(_ ptr: UnsafeRawPointer)
 /// Actions:
 ///
 /// - `YieldAction`:
-///   - `resume`:  The next consumer is resumed with the newly yielded value.
+///   - `resume`:  The oldest queued consumer is resumed with the newly yielded value.
 ///   - `none`:  No action is taken.
 ///
 /// - `NextAction`:
-///   - `resume`: The new consumer is resumed.
+///   - `resume`: The new consumer is resumed with the oldest buffered element or `nil`.
 ///   - `throw`: The new consumer is resumed by throwing an error of type `Failure`.
-///   - `suspend`:  The new consumer is enqueued. No action is taken.
+///   - `none`:  No action is taken.
 ///
 /// - `TerminateAction`:
 ///   - `finalize`: The `TerminationHandler` and `finalize()` are invoked.
 ///   - `none`: No action is taken.
 ///
 /// - `FinalizeAction`:
-///   - `resume`: All suspended consumers are resumed.
+///   - `resume`: All queued consumers are resumed.
 ///   - `none`: No action is taken.
 ///
 /// Concurrent Behavior:
 ///
-/// The state machine is single-consumer–base,
-/// yielded elements are, at most once, deliverd to a singel consumer.
-/// However, on concurrent iteration, consumers are enqueued
-/// in a **FIFO queue** and **eventually resumed**.
-///
-/// `onTermination` Behavior:
-///
-/// Every state permits assigning a new closure to the `onTermination` property,
-/// including `.terminated`. However, regardless of whether `onTermination` is `nil`
-/// once the stream has been terminated, it is impossible to invoke `onTermination` again.
+/// The state machine delivers each yielded element to only a **single consumer;**
+/// during concurrent iteration, it enqueues new consumers in a **FIFO queue** and
+/// **eventually resumes** them.
 ///
 /// Finishing Behavior:
 ///
-/// A throwing stream that has been **terminated due to cancellation is unfinished**,
-/// and can be **finished once** with a specific error
-/// by calling the `finish(throwing:)` method.
-///
-/// Specifically, an unfinished terminal stream is itself a transient state
-/// during the finalization process. If no call to `finish()` / `finish(throwing:)`
-/// occurs during finalization, e.g., from within `onTermination`,
-/// the stream will be **automatically finished** after `onTermination`
-/// was invoked.
-///
-/// - Note: While the same mechanism applies to `AsyncStream`,
-/// since it is non-throwing, whether the termination reason is cancellation
-/// or the stream being finished makes no difference: a terminal `AsyncStream`
-/// that has drained all its buffered elements will always return `nil`.
+/// A stream **terminated due to cancellation is unfinished**,
+/// and can be **finished once during finalization** by calling one of the `finish` methods.
+/// If no such call occurs during finalization (e.g., in `onTermination`),
+/// the stream is **finished automatically** after `onTermination` returns.
 @safe
 internal final class _AsyncStreamStorage<
   Element, Failure: Error, PublicTermination
@@ -230,7 +213,7 @@ internal final class _AsyncStreamStorage<
         failure: Failure
       )
 
-      case suspend
+      case none
     }
 
     enum TerminateAction: ~Copyable {
@@ -457,7 +440,7 @@ extension _AsyncStreamStorage.StateMachine {
           bufferingPolicy: idle.bufferingPolicy,
           terminationHandler: idle.terminationHandler.take()
         )))
-        return unsafe .suspend
+        return unsafe .none
 
       } else {
         let element = idle.buffer.removeFirst()
@@ -471,7 +454,7 @@ extension _AsyncStreamStorage.StateMachine {
     case .waiting(var waiting):
       unsafe waiting.consumers.append(consumer)
       unsafe self = .init(state: .waiting(waiting))
-      return unsafe .suspend
+      return unsafe .none
 
     case .draining(var draining):
       let element = draining.buffer.removeFirst()
@@ -502,7 +485,7 @@ extension _AsyncStreamStorage.StateMachine {
     case .terminating(var terminating):
       unsafe terminating.consumers.append(consumer)
       unsafe self = .init(state: .terminating(terminating))
-      return unsafe .suspend
+      return unsafe .none
 
     case .terminated(let terminated):
       unsafe self = .init(state: .terminated(.init()))
@@ -674,7 +657,7 @@ extension _AsyncStreamStorage {
     case .throw(let consumer, let failure):
       unsafe consumer.resume(returning: .failure(failure))
 
-    case .suspend:
+    case .none:
       return
     }
   }
