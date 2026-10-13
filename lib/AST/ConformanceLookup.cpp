@@ -333,6 +333,15 @@ static bool isCopyableFunctionType(EitherFunctionType eitherFnTy) {
   return true;
 }
 
+/// Whether the given function type conforms to Deinitable.
+static bool isDeinitableFunctionType(EitherFunctionType eitherFnTy) {
+  // An exactly-once value must be called, so it can't be destroyed implicitly.
+  if (auto fnTy = eitherFnTy.dyn_cast<const AnyFunctionType *>())
+    return !fnTy->isCalledOnce();
+
+  return !cast<const SILFunctionType *>(eitherFnTy)->isCalledOnce();
+}
+
 /// Whether the given function type conforms to Escapable.
 static bool isEscapableFunctionType(EitherFunctionType eitherFnTy) {
   if (auto silFnTy = eitherFnTy.dyn_cast<const SILFunctionType *>()) {
@@ -409,6 +418,10 @@ static ProtocolConformanceRef getBuiltinFunctionTypeConformance(
       if (isCopyableFunctionType(functionType))
         return synthesizeConformance();
       break;
+    case KnownProtocolKind::Deinitable:
+      if (isDeinitableFunctionType(functionType))
+        return synthesizeConformance();
+      break;
     case KnownProtocolKind::BitwiseCopyable:
       if (isBitwiseCopyableFunctionType(functionType))
         return synthesizeConformance();
@@ -482,6 +495,7 @@ static ProtocolConformanceRef getBuiltinMetaTypeTypeConformance(
 
     case KnownProtocolKind::Copyable:
     case KnownProtocolKind::Escapable:
+    case KnownProtocolKind::Deinitable:
     case KnownProtocolKind::BitwiseCopyable:
     case KnownProtocolKind::SendableMetatype:
       return ProtocolConformanceRef(
@@ -505,7 +519,8 @@ getBuiltinBuiltinTypeConformance(Type type, const BuiltinType *builtinType,
     case KnownProtocolKind::Sendable:
     case KnownProtocolKind::SendableMetatype:
     case KnownProtocolKind::Copyable:
-    case KnownProtocolKind::Escapable: {
+    case KnownProtocolKind::Escapable:
+    case KnownProtocolKind::Deinitable: {
       ASTContext &ctx = protocol->getASTContext();
 
       // FixedArray is Sendable, Copyable, or Escapable if its element type is.
@@ -658,6 +673,10 @@ LookupConformanceRequest::evaluate(Evaluator &evaluator,
   // PlaceholderType is a placeholder for an unknown type. We consider it to
   // conform to all protocols, since the intended type might have.
   if (type->is<PlaceholderType>())
+    return ProtocolConformanceRef::forAbstract(type, protocol);
+
+  // Same goes for HoleType.
+  if (type->is<HoleType>())
     return ProtocolConformanceRef::forAbstract(type, protocol);
 
   // Pack types can conform to protocols.
@@ -843,7 +862,7 @@ LookupConformanceRequest::evaluate(Evaluator &evaluator,
     // Dig out the conforming nominal type.
     auto rootConformance = inherited->getRootConformance();
     auto conformingClass
-      = rootConformance->getType()->getClassOrBoundGenericClass();
+      = rootConformance->getType()->getClassDecl();
 
     // Map up to our superclass's type.
     auto superclassTy = type->getSuperclassForDecl(conformingClass);
@@ -1025,6 +1044,16 @@ bool TypeBase::isEscapable() {
   if (!Bits.TypeBase.ComputedInvertibleConformances)
     computeInvertibleConformances();
   return Bits.TypeBase.IsEscapable;
+}
+
+bool TypeBase::isDeinitable() {
+  Type type(this);
+  if (auto *pet = type->getAs<PackExpansionType>())
+    type = pet->getPatternType();
+  auto canType = type->getReferenceStorageReferent()
+                     ->getWithoutSpecifierType()
+                     ->getCanonicalType();
+  return conformsToInvertible(canType, InvertibleProtocolKind::Deinitable);
 }
 
 bool TypeBase::isEscapable(GenericSignature sig) {

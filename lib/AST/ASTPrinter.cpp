@@ -2375,6 +2375,19 @@ void PrintAST::printRequirementSignature(ProtocolDecl *owner,
                         sig.getRequirements().end());
   }
 
+  // Compilers without the Deinitable protocol can't parse requirements that
+  // mention it.
+  if (Options.SuppressDeinitableProtocol) {
+    llvm::erase_if(requirements, [](Requirement req) {
+      return req.getKind() == RequirementKind::Conformance &&
+             req.getProtocolDecl()->isSpecificProtocol(
+                 KnownProtocolKind::Deinitable);
+    });
+    llvm::erase_if(inverses, [](InverseRequirement inverse) {
+      return inverse.getKind() == InvertibleProtocolKind::Deinitable;
+    });
+  }
+
   if (attachingTo) {
     llvm::erase_if(requirements,
                    [&](Requirement req) {
@@ -3667,6 +3680,13 @@ static void suppressingFeatureTildeSendable(PrintOptions &options,
 }
 
 static void
+suppressingFeatureDeinitableProtocol(PrintOptions &options,
+                                     llvm::function_ref<void()> action) {
+  llvm::SaveAndRestore<bool> scope(options.SuppressDeinitableProtocol, true);
+  action();
+}
+
+static void
 suppressingFeatureCAttribute(PrintOptions &options,
                                      llvm::function_ref<void()> action) {
   llvm::SaveAndRestore<bool> scope(options.SuppressCAttribute, true);
@@ -4859,7 +4879,7 @@ void PrintAST::visitFuncDecl(FuncDecl *decl) {
       auto *proto = dyn_cast<ProtocolDecl>(decl->getDeclContext());
       if (proto && Options.TransformContext) {
         auto BaseType = Options.TransformContext->getBaseType();
-        if (BaseType->getClassOrBoundGenericClass()) {
+        if (BaseType->getClassDecl()) {
           ResultTy = ResultTy.transformRec(
             [&](TypeBase *t) -> std::optional<Type> {
               if (isa<DependentMemberType>(t))
@@ -5098,7 +5118,7 @@ void PrintAST::visitConstructorDecl(ConstructorDecl *decl) {
     // printing onto a class.
     bool isClassContext;
     if (CurrentType) {
-      isClassContext = CurrentType->getClassOrBoundGenericClass() != nullptr;
+      isClassContext = CurrentType->getClassDecl() != nullptr;
     } else {
       const DeclContext *dc = decl->getDeclContext();
       isClassContext = dc->getSelfClassDecl() != nullptr;
@@ -6817,29 +6837,18 @@ public:
     Printer << ")";
   }
 
-  void visitPlaceholderType(PlaceholderType *T,
-                            NonRecursivePrintOptions nrOptions) {
+  void visitPlaceholderType(PlaceholderType *, NonRecursivePrintOptions) {
     if (Options.PrintTypesForDebugging) {
-      Printer << "<<placeholder for ";
-      auto originator = T->getOriginator();
-      if (auto *typeVar = originator.dyn_cast<TypeVariableType *>()) {
-        visit(typeVar);
-      } else if (auto *VD = originator.dyn_cast<VarDecl *>()) {
-        Printer << "decl = ";
-        Printer << VD->getName();
-      } else if (isa<ErrorExpr *>(originator)) {
-        Printer << "error_expr";
-      } else if (auto *errTy = originator.dyn_cast<ErrorType *>()) {
-        visit(errTy);
-      } else if (auto *DMT = originator.dyn_cast<DependentMemberType *>()) {
-        visit(DMT);
-      } else if (isa<TypeRepr *>(originator)) {
-        Printer << "type_repr";
-      } else if (isa<Pattern *>(originator)) {
-        Printer << "pattern";
-      } else {
-        assert(false && "unknown originator");
-      }
+      Printer << "<<placeholder>>";
+    } else {
+      Printer << "_";
+    }
+  }
+
+  void visitHoleType(HoleType *T, NonRecursivePrintOptions nrOptions) {
+    if (Options.PrintTypesForDebugging) {
+      Printer << "<<hole for ";
+      visit(T->getOriginator());
       Printer << ">>";
     } else {
       Printer << "<<hole>>";

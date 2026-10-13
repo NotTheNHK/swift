@@ -109,7 +109,7 @@ Solution::computeSubstitutions(NullablePtr<ValueDecl> decl,
   for (const auto &opened : openedTypes->second) {
     auto type = getFixedType(opened.second);
     if (opened.first->isParameterPack()) {
-      if (type->is<PlaceholderType>()) {
+      if (type->is<HoleType>()) {
         type = PackType::get(
             ctx,
             {PackExpansionType::get(ErrorType::get(ctx), ErrorType::get(ctx))});
@@ -1116,7 +1116,8 @@ namespace {
                                              DeclContext *declOrClosure,
                                              ParameterList *thunkParamList,
                                              ConstraintLocatorBuilder locator) {
-      auto *const fnTy = cs.getType(fnExpr)->castTo<FunctionType>();
+      auto *const fnTy =
+          solution.getResolvedType(fnExpr)->castTo<FunctionType>();
       auto *calleeFnTy = fnTy;
 
       if (baseExpr) {
@@ -1181,7 +1182,7 @@ namespace {
 
           paramRef = AppliedPropertyWrapperExpr::create(
               ctx, calleeDeclRef, calleeParamDecl, SourceLoc(),
-              appliedWrapper.wrapperType, paramRef, valueKind);
+              simplifyType(appliedWrapper.wrapperType), paramRef, valueKind);
           cs.cacheExprTypes(paramRef);
 
           newCalleeParams.push_back(calleeParam.withType(paramRef->getType()));
@@ -4345,7 +4346,7 @@ namespace {
           auto destObjectType = destValueType;
           if (auto metaTy = destObjectType->getAs<MetatypeType>())
             destObjectType = metaTy->getInstanceType();
-          if (auto destClass = destObjectType->getClassOrBoundGenericClass()) {
+          if (auto destClass = destObjectType->getClassDecl()) {
             if (destClass->getForeignClassKind() ==
                   ClassDecl::ForeignKind::CFType) {
               if (SuppressDiagnostics)
@@ -7071,7 +7072,7 @@ Expr *ExprRewriter::buildObjCBridgeExpr(Expr *expr, Type toType,
     // FIXME: Ideally we would instead have already recorded a restriction
     // when solving the constraint, and we wouldn't need to duplicate this
     // part of coerceToType() here.
-    if (auto foreignClass = toType->getClassOrBoundGenericClass()) {
+    if (auto foreignClass = toType->getClassDecl()) {
       if (foreignClass->getForeignClassKind() ==
             ClassDecl::ForeignKind::CFType) {
         return cs.cacheType(new (ctx)
@@ -7209,8 +7210,8 @@ Expr *ConstraintSystem::addImplicitLoadExpr(Expr *expr) {
 
 Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
                                  ConstraintLocatorBuilder locator) {
-  ASSERT(toType && !toType->hasError() &&
-         !toType->hasTypeVariableOrPlaceholder());
+  ASSERT(toType && !toType->hasError() && !toType->hasTypeVariableOrHole() &&
+         !toType->hasPlaceholder());
 
   // Diagnose conversions to invalid function types that couldn't be performed
   // beforehand because of placeholders.
@@ -7453,7 +7454,7 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
     }
 
     case ConversionRestrictionKind::CFTollFreeBridgeToObjC: {
-      auto foreignClass = fromType->getClassOrBoundGenericClass();
+      auto foreignClass = fromType->getClassDecl();
       auto objcType = foreignClass->getAttrs().getAttribute<ObjCBridgedAttr>()
                         ->getObjCClass()->getDeclaredInterfaceType();
       auto asObjCClass =
@@ -7462,7 +7463,7 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
     }
 
     case ConversionRestrictionKind::ObjCTollFreeBridgeToCF: {
-      auto foreignClass = toType->getClassOrBoundGenericClass();
+      auto foreignClass = toType->getClassDecl();
       auto objcType = foreignClass->getAttrs().getAttribute<ObjCBridgedAttr>()
                         ->getObjCClass()->getDeclaredInterfaceType();
       Expr *result = coerceToType(expr, objcType, locator);
@@ -7684,7 +7685,7 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
   case TypeKind::DynamicSelf:
   case TypeKind::BoundGenericClass:
   case TypeKind::Class: {
-    if (!toType->getClassOrBoundGenericClass())
+    if (!toType->getClassDecl())
       break;
     for (auto fromSuperClass = fromType->getSuperclass();
          fromSuperClass;
@@ -7998,7 +7999,7 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
       llvm_unreachable("unhandled metatype kind");
     }
     
-    if (auto toClass = toType->getClassOrBoundGenericClass()) {
+    if (auto toClass = toType->getClassDecl()) {
       if (toClass->getName() == ctx.Id_Protocol
           && toClass->getModuleContext()->getName()
               == ctx.Id_ObjectiveC) {
@@ -8726,7 +8727,7 @@ Expr *ExprRewriter::finishApply(ApplyExpr *apply, Type openedType,
   }
 
   // We're constructing a value of nominal type.
-  assert(ty->getNominalOrBoundGenericNominal() || ty->is<DynamicSelfType>() ||
+  assert(ty->getNominalDecl() || ty->is<DynamicSelfType>() ||
          ty->isExistentialType() || ty->is<ArchetypeType>());
 
   // Consider the constructor decl reference expr 'implicit', but the
@@ -9010,23 +9011,21 @@ namespace {
       exprType = solution.simplifyType(exprType);
       // assert((!expr->getType() || expr->getType()->isEqual(exprType)) &&
       //       "Mismatched types!");
-      assert(!exprType->getRecursiveProperties().isSolverAllocated() &&
-             "Should not write solver allocated type into expression!");
-      assert(!exprType->hasPlaceholder() &&
-             "Should not write type placeholders into expression!");
+      auto assertValidType = [](Type ty) {
+        ASSERT(!ty->getRecursiveProperties().isSolverAllocated() &&
+               "Should not write solver allocated type into expression!");
+        ASSERT(!ty->hasHole() && "Should not write holes into expression!");
+        ASSERT(!ty->hasPlaceholder() &&
+               "Should not write placeholders into expression!");
+      };
+      assertValidType(exprType);
       expr->setType(exprType);
 
       if (auto kp = dyn_cast<KeyPathExpr>(expr)) {
         for (auto i : indices(kp->getComponents())) {
-          Type componentType;
           if (cs.hasType(kp, i)) {
-            componentType = solution.simplifyType(cs.getType(kp, i));
-            assert(
-                !componentType->getRecursiveProperties().isSolverAllocated() &&
-                "Should not write solver allocated type into key-path "
-                "component!");
-            assert(!componentType->hasPlaceholder() &&
-                   "Should not write type placeholder into key-path component");
+            auto componentType = solution.simplifyType(cs.getType(kp, i));
+            assertValidType(componentType);
             kp->getMutableComponents()[i].setComponentType(componentType);
           }
         }
@@ -9897,7 +9896,8 @@ ConstraintSystem::applySolution(Solution &solution,
   // unresolved types.
   {
     auto isValidType = [&](Type ty) {
-      return !ty->hasError() && !ty->hasTypeVariableOrPlaceholder();
+      return !ty->hasError() && !ty->hasPlaceholder() &&
+             !ty->hasTypeVariableOrHole();
     };
     for (auto pair : solution.typeBindings) {
       if (!isValidType(pair.second)) {

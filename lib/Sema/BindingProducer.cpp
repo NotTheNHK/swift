@@ -46,7 +46,7 @@ static Type getOptionalSuperclass(Type type) {
       // This is especially important for Sendable key paths because
       // to reserve sendability of the original type.
       for (auto member : compositionTy->getMembers()) {
-        if (member->getClassOrBoundGenericClass()) {
+        if (member->getClassDecl()) {
           member = member->getSuperclass();
           if (!member)
             return Type();
@@ -372,7 +372,7 @@ bool TypeVarBindingProducer::computeNext() {
       // introducing Void will just cause local solution ambiguities.
       if (getLocator()->isLastElement<LocatorPathElt::ClosureResult>() &&
           binding.Kind == AllowedBindingKind::Supertypes &&
-          !binding.BindingType->isPlaceholder()) {
+          !binding.BindingType->is<HoleType>()) {
         auto voidType = CS.getASTContext().TheEmptyTupleType;
         addNewBinding(binding.withSameSource(voidType, BindingKind::Exact));
       }
@@ -686,7 +686,7 @@ bool TypeVariableBinding::attempt(ConstraintSystem &cs) const {
       return false;
     
     // Reflect in the score that this type variable couldn't be
-    // resolved and had to be bound to a placeholder "hole" type.
+    // resolved and had to be bound to a hole type.
     cs.increaseScore(SK_Hole, srcLocator);
 
     if (auto fix = fixForHole(cs)) {
@@ -701,7 +701,7 @@ bool TypeVariableBinding::attempt(ConstraintSystem &cs) const {
     cs.recordDefaultedConstraint(srcLocator);
 
     // Fail if hole reporting fails.
-    if (type->isPlaceholder() && reportHole())
+    if (type->is<HoleType>() && reportHole())
       return false;
   }
 
