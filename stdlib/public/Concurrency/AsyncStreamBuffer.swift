@@ -52,6 +52,17 @@ func _lock(_ ptr: UnsafeRawPointer)
 func _unlock(_ ptr: UnsafeRawPointer)
 #endif
 
+fileprivate func _lockCreate() -> UnsafeRawPointer {
+  let ptr = unsafe UnsafeMutableRawPointer.allocate(
+    byteCount: _lockWordCount() * MemoryLayout<UnsafeRawPointer>.stride,
+    alignment: MemoryLayout<UnsafeRawPointer>.alignment
+  )
+
+  unsafe _lockInit(ptr)
+
+  return UnsafeRawPointer(ptr)
+}
+
 /// The state machine backing the continuation-based variant of `Async{Throwing}Stream`.
 ///
 /// States:
@@ -246,16 +257,11 @@ internal final class _AsyncStreamStorage<
     }
   }
 
-  private let lock: UnsafeMutableRawPointer
+  private let lock: UnsafeRawPointer
   private var stateMachine: StateMachine
 
   init(bufferingPolicy: Continuation.BufferingPolicy) {
-    unsafe self.lock = unsafe UnsafeMutableRawPointer.allocate(
-      byteCount: _lockWordCount() * MemoryLayout<UnsafeRawPointer>.stride,
-      alignment: MemoryLayout<UnsafeRawPointer>.alignment
-    )
-    unsafe _lockInit(self.lock)
-
+    unsafe self.lock = _lockCreate()
     self.stateMachine = StateMachine(
       bufferingPolicy: bufferingPolicy
     )
