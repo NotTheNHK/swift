@@ -191,7 +191,7 @@ internal final class _AsyncStreamStorage<
     }
 
     @unsafe
-    enum YieldAction {
+    enum YieldAction: ~Copyable {
       case resume(
         consumer: Consumer,
         element: Element,
@@ -202,7 +202,7 @@ internal final class _AsyncStreamStorage<
     }
 
     @unsafe
-    enum NextAction {
+    enum NextAction: ~Copyable {
       case resume(
         consumer: Consumer,
         element: Element?
@@ -635,7 +635,7 @@ extension _AsyncStreamStorage {
     let action = unsafe self.stateMachine.yield(value)
     unsafe _unlock(self.lock)
 
-    switch unsafe action {
+    switch unsafe consume action {
     case .resume(let consumer, let element, let yieldResult):
       unsafe consumer.resume(returning: .success(element))
       return yieldResult
@@ -650,7 +650,7 @@ extension _AsyncStreamStorage {
       return unsafe state.next(consumer)
     }
 
-    switch unsafe action {
+    switch unsafe consume action {
     case .resume(let consumer, let element):
       unsafe consumer.resume(returning: .success(element))
 
