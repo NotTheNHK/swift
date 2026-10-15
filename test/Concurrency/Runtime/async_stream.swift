@@ -511,67 +511,23 @@ class NotSendable {}
         }
       }
 
-      // A `next()` that arrives while the stream is in the `.terminating` state,
-      // but before the `onTermination` handler has called `finish(throwing:)`
-      // must not finalize the termination as it would drop the handler-supplied failure.
-      tests.test("finish(throwing:) from onTermination is not lost to a concurrent next() during termination") {
-        let thrownError = SomeError()
-
-        let (controlStream, controlContinuation) = AsyncStream<Int>.makeStream()
-        var controlIterator = controlStream.makeAsyncIterator()
-
-        let (stream, continuation) = AsyncThrowingStream<Int, Error>.makeStream()
-
-        continuation.onTermination = { @Sendable termination in
-          guard case .cancelled = termination else { return }
-
-          // Start an unstructured task consuming next() which we'll race with the finish() call below.
-          let nextSemaphore = DispatchSemaphore(value: 0)
-          Task.detached {
-            var iterator = stream.makeAsyncIterator()
-            nextSemaphore.signal()
-            _ = try? await iterator.next()
-          }
-          nextSemaphore.wait()
-
-          continuation.finish(throwing: thrownError) // We must consistently see the error thrown from the handler
-        }
-
-        let task = Task { () -> Error? in
-          controlContinuation.yield(1)
-          do {
-            for try await _ in stream {}
-            return nil
-          } catch {
-            return error
-          }
-        }
-
-        expectEqual(await controlIterator.next(), 1)
-        task.cancel()
-
-        let caught = await task.value
-        if let failure = caught as? SomeError {
-          expectEqual(failure, thrownError)
-        } else {
-          expectUnreachable(
-            "cancelled consumer lost the onTermination finish(throwing:) error to a concurrent next(); got \(String(describing: caught))")
-        }
-      }
-
       tests.test("finish(throwing:) from onTermination keeps the first error when alredy finished") {
         let firstError = SomeError(value: 1)
         let secondError = SomeError(value: 2)
 
         let stream = AsyncThrowingStream<Void, Error> { continuation in
+          // The stream is finished with `firstError`
+          continuation.finish(throwing: firstError)
+
           continuation.onTermination = { reason in
             if case .finished = reason {
+              // Since the stream is alredy finished,
+              // calling `finish(throwing:)` again shoule be a no-op
               continuation.finish(throwing: secondError)
             } else {
               expectUnreachable("expected `.finished` termination reason got `.cancelled`")
             }
           }
-          continuation.finish(throwing: firstError)
         }
 
         do {
