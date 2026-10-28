@@ -1,12 +1,11 @@
-// RUN: %target-typecheck-verify-swift %import-libdispatch -strict-concurrency=complete -parse-as-library
-// RUN: %target-run-simple-swift( %import-libdispatch -parse-as-library)
-// RUN: %target-run-simple-swift( %import-libdispatch -parse-as-library -swift-version 5 -strict-concurrency=complete -enable-upcoming-feature NonisolatedNonsendingByDefault)
+// RUN: %target-typecheck-verify-swift -strict-concurrency=complete -parse-as-library
+// RUN: %target-run-simple-swift( -parse-as-library)
+// RUN: %target-run-simple-swift( -parse-as-library -swift-version 5 -strict-concurrency=complete -enable-upcoming-feature NonisolatedNonsendingByDefault)
 // REQUIRES: swift_feature_NonisolatedNonsendingByDefault
 
 // REQUIRES: concurrency
 // REQUIRES: executable_test
 // REQUIRES: concurrency_runtime
-// REQUIRES: libdispatch
 
 // rdar://78109470
 // UNSUPPORTED: back_deployment_runtime
@@ -509,6 +508,54 @@ class NotSendable {}
         } else {
           expectUnreachable("expected SomeError, got \(String(describing: caught))")
         }
+      }
+
+      // A `next()` that arrives while the stream is in the `.terminating` state,
+      // but before the `onTermination` handler has called `finish(throwing:)`
+      // must not finalize the termination as it would drop the handler-supplied failure.
+      //
+      // Which consumer observes that failure is deliberately NOT specified: the
+      // handler-supplied error goes to whichever consumer is resumed first. When
+      // cancellation wins the race against the cancelled task's own `next()`
+      // registration, termination begins from a state with no waiting consumer,
+      // so a concurrent `next()` that parks while terminating is resumed first
+      // and receives the error; the cancelled task then sees `nil`. Both
+      // orderings are valid. What the stream does guarantee is that the failure
+      // is delivered to exactly one consumer and never silently dropped.
+      tests.test("finish(throwing:) from onTermination is delivered to exactly one consumer") {
+        let thrownError = SomeError()
+        let (stream, continuation) = AsyncThrowingStream<Void, Error>.makeStream()
+        let (outcomeStream, outcomeContinuation) = AsyncStream<Error?>.makeStream()
+
+        continuation.onTermination = { termination in
+          Task.immediateDetached {
+            do {
+              for try await _ in stream {}
+              outcomeContinuation.yield(nil)
+            } catch {
+              outcomeContinuation.yield(error)
+            }
+            outcomeContinuation.finish()
+          }
+          continuation.finish(throwing: thrownError)
+        }
+
+        let task = Task.immediate {
+          do {
+            for try await _ in stream {}
+            outcomeContinuation.yield(nil)
+          } catch {
+            outcomeContinuation.yield(error)
+          }
+        }
+        task.cancel()
+
+        let outcome = await outcomeStream
+          .compactMap { $0 as? SomeError }
+          .reduce(into: [SomeError]()) { $0.append($1) }
+
+        expectEqual(outcome.count, 1)
+        expectEqual(outcome.first, thrownError)
       }
 
       tests.test("finish(throwing:) from onTermination keeps the first error when alredy finished") {
