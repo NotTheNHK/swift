@@ -85,9 +85,6 @@ namespace {
         return true;
       return false;
     }
-    bool visitBoundGenericClassType(CanBoundGenericClassType type) {
-      return false;
-    }
     bool visitDynamicSelfType(CanDynamicSelfType type) {
       return false;
     }
@@ -160,12 +157,13 @@ TypeConverter::getDeclCaptureKind(CapturedValue capture,
 
   // If this is a noncopyable 'let' constant that is not a shared paramdecl or
   // used by a noescape capture, then we know it is boxed and want to pass it in
-  // its boxed form so we can obey Swift's capture reference semantics.
+  // its boxed form so we can obey Swift's capture reference semantics. An
+  // unannotated closure parameter is shared if the closure's type says so.
   if (!var->supportsMutation()
       && contextTy->isNoncopyable()
       && !capture.isNoEscape()) {
       auto *param = dyn_cast<ParamDecl>(var);
-      if (!param || (param->getValueOwnership() != ValueOwnership::Shared &&
+      if (!param || (param->getLoweredOwnership() != LoweredOwnership::Shared &&
                      !param->isSelfParameter())) {
         return CaptureKind::ImmutableBox;
       }
@@ -911,22 +909,9 @@ namespace {
                                         isSensitive);
     }
 
-    RetTy visitBoundGenericClassType(CanBoundGenericClassType type,
-                                     AbstractionPattern origType,
-                                     IsTypeExpansionSensitive_t isSensitive) {
-      return asImpl().visitAnyClassType(type, origType, type->getDecl(),
-                                        isSensitive);
-    }
-
     // Enums depend on their enumerators.
     RetTy visitEnumType(CanEnumType type, AbstractionPattern origType,
                         IsTypeExpansionSensitive_t isSensitive) {
-      return asImpl().visitAnyEnumType(type, origType, type->getDecl(),
-                                       isSensitive);
-    }
-    RetTy visitBoundGenericEnumType(CanBoundGenericEnumType type,
-                                    AbstractionPattern origType,
-                                    IsTypeExpansionSensitive_t isSensitive) {
       return asImpl().visitAnyEnumType(type, origType, type->getDecl(),
                                        isSensitive);
     }
@@ -934,12 +919,6 @@ namespace {
     // Structs depend on their physical fields.
     RetTy visitStructType(CanStructType type, AbstractionPattern origType,
                           IsTypeExpansionSensitive_t isSensitive) {
-      return asImpl().visitAnyStructType(type, origType, type->getDecl(),
-                                         isSensitive);
-    }
-    RetTy visitBoundGenericStructType(CanBoundGenericStructType type,
-                                      AbstractionPattern origType,
-                                      IsTypeExpansionSensitive_t isSensitive) {
       return asImpl().visitAnyStructType(type, origType, type->getDecl(),
                                          isSensitive);
     }
@@ -3269,8 +3248,8 @@ namespace {
                                              TypeExpansionContext expansion) {
       TypeConverter::NonLayoutTypeRAII nonLayoutLowering(tc);
       SILTypeProperties props;
-      if (auto bgt = dyn_cast<BoundGenericType>(type)) {
-        for (auto paramType : bgt->getGenericArgs()) {
+      if (auto bgt = dyn_cast<NominalType>(type)) {
+        for (auto paramType : bgt.getGenericArgs()) {
           // Use an opaque abstraction pattern for the element type because
           // abstraction does not apply to the generic parameter itself.
           AbstractionPattern origElementType = AbstractionPattern::getOpaque();
@@ -3421,7 +3400,7 @@ static CanType computeLoweredOptionalType(TypeConverter &tc,
   }
 
   auto optDecl = tc.Context.getOptionalDecl();
-  return CanType(BoundGenericEnumType::get(optDecl, Type(), loweredObjectType));
+  return CanEnumType::get(optDecl, CanType(), loweredObjectType, tc.Context);
 }
 
 static CanType
@@ -4727,13 +4706,11 @@ static CanAnyFunctionType getEntryPointInterfaceType(ASTContext &C) {
   if (auto PointerDecl = C.getUnsafeMutablePointerDecl()) {
     if (auto Int8Decl = C.getInt8Decl()) {
       Type Int8Ty = Int8Decl->getDeclaredInterfaceType();
-      Type PointerInt8Ty = BoundGenericType::get(PointerDecl,
-                                                 nullptr,
-                                                 Int8Ty);
+      Type PointerInt8Ty = NominalType::get(PointerDecl, nullptr,
+                                            Int8Ty, C);
       Type OptPointerInt8Ty = OptionalType::get(PointerInt8Ty);
-      PtrPtrInt8Ty = BoundGenericType::get(PointerDecl,
-                                           nullptr,
-                                           OptPointerInt8Ty)
+      PtrPtrInt8Ty = NominalType::get(PointerDecl, nullptr,
+                                      OptPointerInt8Ty, C)
         ->getCanonicalType();
     }
   }
@@ -5314,14 +5291,28 @@ TypeConverter::getLoweredLocalCaptures(SILDeclRef fn) {
 
   collectConstantCaptures(fn);
 
-  // @_inheritActorContext(always) attribute allows implicit
-  // capture of isolation parameter from the context. This
-  // cannot be done as part of computing captures because
-  // isolation is not available at that point because it in
-  // turn depends on captures sometimes.
+  // Handle implicit isolation captures:
   if (auto *closure = fn.getClosureExpr()) {
+    // @_inheritActorContext(always) attribute allows implicit
+    // capture of isolation parameter from the context. This
+    // cannot be done as part of computing captures because
+    // isolation is not available at that point because it in
+    // turn depends on captures sometimes.
     if (closure->alwaysInheritsActorContext()) {
       auto isolation = closure->getActorIsolation();
+      if (isolation.isActorInstanceIsolated()) {
+        if (auto *var = isolation.getActorInstance()) {
+          recordCapture(CapturedValue(var, /*flags=*/0, SourceLoc()));
+        } else if (auto *actorExpr = isolation.getActorInstanceExpr()) {
+          recordCapture(CapturedValue(actorExpr, /*flags=*/0));
+        }
+      }
+    }
+  } else if (auto *deferBody = fn.getDeferBodyFuncDecl()) {
+    // A defer in a closure inherits the isolation of the closure, and may
+    // need to capture the actor it is isolated to.
+    if (deferBody->getCaptureInfo().needsImplicitIsolationCapture()) {
+      auto isolation = getActorIsolation(deferBody);
       if (isolation.isActorInstanceIsolated()) {
         if (auto *var = isolation.getActorInstance()) {
           recordCapture(CapturedValue(var, /*flags=*/0, SourceLoc()));
@@ -5356,9 +5347,11 @@ TypeConverter::getLoweredLocalCaptures(SILDeclRef fn) {
   }
 
   // Cache the result.
-  CaptureInfo info(Context, resultingCaptures,
-                   capturesDynamicSelf, capturesOpaqueValue,
-                   capturesGenericParams, genericEnv.getArrayRef(),
+  OptionSet<CaptureInfo::Flags> flags;
+  if (capturesGenericParams)
+    flags |= CaptureInfo::Flags::HasGenericParamCaptures;
+  CaptureInfo info(Context, resultingCaptures, capturesDynamicSelf,
+                   capturesOpaqueValue, flags, genericEnv.getArrayRef(),
                    capturedTypes);
   auto inserted = LoweredCaptures.insert({fn, info});
   assert(inserted.second && "already in map?!");

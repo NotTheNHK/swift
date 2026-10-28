@@ -283,7 +283,20 @@ swift::constraints::getConversionBehavior(Type type) {
     auto structTy = cast<StructType>(canType);
     auto *decl = structTy->getDecl();
 
-    if (decl == ctx.getAnyHashableDecl())
+    // These are all non-generic declarations.
+    if (decl == ctx.getArrayDecl())
+      return ConversionBehavior::Array;
+    else if (decl == ctx.getDictionaryDecl())
+      return ConversionBehavior::Dictionary;
+    else if (decl == ctx.getSetDecl())
+      return ConversionBehavior::Set;
+    else if (decl == ctx.getUnsafePointerDecl() ||
+             decl == ctx.getUnsafeMutablePointerDecl() ||
+             decl == ctx.getAutoreleasingUnsafeMutablePointerDecl())
+      return ConversionBehavior::Pointer;
+
+    // These are all generic declarations.
+    else if (decl == ctx.getAnyHashableDecl())
       return ConversionBehavior::AnyHashable;
     else if (decl == ctx.getStringDecl())
       return ConversionBehavior::String;
@@ -297,34 +310,12 @@ swift::constraints::getConversionBehavior(Type type) {
     return ConversionBehavior::None;
   }
 
-  case TypeKind::BoundGenericStruct: {
-    auto structTy = cast<BoundGenericStructType>(canType);
-    auto *decl = structTy->getDecl();
-
-    if (decl == ctx.getArrayDecl())
-      return ConversionBehavior::Array;
-    else if (decl == ctx.getDictionaryDecl())
-      return ConversionBehavior::Dictionary;
-    else if (decl == ctx.getSetDecl())
-      return ConversionBehavior::Set;
-    else if (decl == ctx.getUnsafePointerDecl() ||
-             decl == ctx.getUnsafeMutablePointerDecl() ||
-             decl == ctx.getAutoreleasingUnsafeMutablePointerDecl())
-      return ConversionBehavior::Pointer;
-
-    return ConversionBehavior::None;
-  }
-
   case TypeKind::Class:
-  case TypeKind::BoundGenericClass:
   case TypeKind::DynamicSelf:
     return ConversionBehavior::Class;
 
-  case TypeKind::Enum:
-    return ConversionBehavior::None;
-
-  case TypeKind::BoundGenericEnum: {
-    auto enumTy = cast<BoundGenericEnumType>(canType);
+  case TypeKind::Enum: {
+    auto enumTy = cast<EnumType>(canType);
     if (enumTy->getDecl() == ctx.getOptionalDecl())
       return ConversionBehavior::Optional;
 
@@ -1153,75 +1144,128 @@ static Type superclassJoinMeetImpl(Operation op, Type lhs, Type rhs) {
   return Type();
 }
 
+/// Joins or meets the properties of \p lhsInfo and \p rhsInfo that can depend
+/// on a type, along with the types they depend on, into \p result. Returns
+/// std::nullopt if the result can't be represented.
+///
+/// Each such property has a least restrictive value, e.g. @Sendable rather than
+/// non-Sendable, and a dependent type stands for whether the property has that
+/// value.
+static std::optional<ASTExtInfoBuilder>
+joinMeetTypeDependencies(Operation op, AnyFunctionType::ExtInfo lhsInfo,
+                         AnyFunctionType::ExtInfo rhsInfo,
+                         ASTExtInfoBuilder result) {
+  auto isLeastRestrictive = [](TypeDependenceKind kind,
+                               AnyFunctionType::ExtInfo info) {
+    switch (kind) {
+    case TypeDependenceKind::Sendable:
+      return info.isSendable();
+    case TypeDependenceKind::ExecutionSemantics:
+      return !info.hasCalledAtMostOnceSemantics();
+    }
+    llvm_unreachable("unhandled kind");
+  };
+
+  // While a property depends on a type, it keeps its default value.
+  auto setTypeDependency = [&](TypeDependenceKind kind, Type type) {
+    switch (kind) {
+    case TypeDependenceKind::Sendable:
+      result = result.withSendable(false);
+      break;
+    case TypeDependenceKind::ExecutionSemantics:
+      result = result.withExecutionSemantics(std::nullopt);
+      break;
+    }
+    result = result.withTypeDependency(kind, type);
+  };
+
+  auto dropTypeDependency = [&](TypeDependenceKind kind,
+                                AnyFunctionType::ExtInfo from) {
+    switch (kind) {
+    case TypeDependenceKind::Sendable:
+      result = result.withSendable(from.isSendable());
+      break;
+    case TypeDependenceKind::ExecutionSemantics:
+      result = result.withExecutionSemantics(from.getExecutionSemantics());
+      break;
+    }
+    result = result.withTypeDependency(kind, Type());
+  };
+
+  auto joinMeetConcrete = [&](TypeDependenceKind kind) {
+    switch (kind) {
+    case TypeDependenceKind::Sendable:
+      result = result.withSendable(
+          op == Operation::Join ? lhsInfo.isSendable() && rhsInfo.isSendable()
+                                : lhsInfo.isSendable() || rhsInfo.isSendable());
+      break;
+    case TypeDependenceKind::ExecutionSemantics: {
+      // The join suppresses the invertible protocols that either side does,
+      // and the meet those that both sides do.
+      auto inverses =
+          getSuppressedInvertibleProtocols(lhsInfo.getExecutionSemantics());
+      auto rhsInverses =
+          getSuppressedInvertibleProtocols(rhsInfo.getExecutionSemantics());
+      if (op == Operation::Join)
+        inverses.insertAll(rhsInverses);
+      else
+        inverses.intersect(rhsInverses);
+      result = result.withExecutionSemantics(
+          getExecutionSemanticsSuppressing(inverses));
+      break;
+    }
+    }
+  };
+
+  for (unsigned i = 0; i != NumTypeDependenceKinds; ++i) {
+    auto kind = TypeDependenceKind(i);
+    auto lhsDep = lhsInfo.getTypeDependencyFor(kind);
+    auto rhsDep = rhsInfo.getTypeDependencyFor(kind);
+
+    if (!lhsDep && !rhsDep) {
+      joinMeetConcrete(kind);
+      continue;
+    }
+
+    if (lhsDep && rhsDep) {
+      // We cannot represent the meet of two dependent types.
+      if (op == Operation::Meet)
+        return std::nullopt;
+
+      // A tuple conforms to a protocol iff all of its elements do, so the
+      // join has the least restrictive value iff both dependent types give it.
+      TupleTypeElt elts[] = {lhsDep, rhsDep};
+      setTypeDependency(kind, TupleType::get(elts, lhsDep->getASTContext()));
+      continue;
+    }
+
+    // The join keeps the dependence if the other side has the least
+    // restrictive value, and the meet if it doesn't. Otherwise, the other
+    // side's value is the result.
+    auto otherInfo = lhsDep ? rhsInfo : lhsInfo;
+    if (isLeastRestrictive(kind, otherInfo) == (op == Operation::Join))
+      setTypeDependency(kind, lhsDep ? lhsDep : rhsDep);
+    else
+      dropTypeDependency(kind, otherInfo);
+  }
+
+  return result;
+}
+
 static std::optional<AnyFunctionType::ExtInfo>
 extInfoJoinMeetImpl(Operation op,
                     AnyFunctionType::ExtInfo lhsInfo,
                     AnyFunctionType::ExtInfo rhsInfo) {
-  bool noEscape, sendable, throwing, async;
-  std::optional<ExecutionSemantics> executionSemantics;
-  Type sendableDep;
-  Type executionSemanticsDep;
+  bool noEscape, throwing, async;
   Type thrownError;
 
   // Concurrency is too hard to reason about here.
   if (lhsInfo.getIsolation() != rhsInfo.getIsolation())
     return std::nullopt;
 
-  auto lhsSendableDep = lhsInfo.getSendableDependentType();
-  auto rhsSendableDep = rhsInfo.getSendableDependentType();
-
-  auto lhsExecutionSemanticsDep = lhsInfo.getExecutionSemanticsDependentType();
-  auto rhsExecutionSemanticsDep = rhsInfo.getExecutionSemanticsDependentType();
-
   if (op == Operation::Join) {
     noEscape = lhsInfo.isNoEscape() || rhsInfo.isNoEscape();
     async = lhsInfo.isAsync() || rhsInfo.isAsync();
-
-    if (lhsSendableDep && rhsSendableDep) {
-      // Form a tuple; its Sendable iff both components are Sendable.
-      SmallVector<TupleTypeElt, 2> elts;
-      elts.push_back(lhsSendableDep);
-      elts.push_back(rhsSendableDep);
-      sendableDep = TupleType::get(elts, lhsSendableDep->getASTContext());
-      sendable = false;
-    } else if (lhsSendableDep && !rhsSendableDep) {
-      if (rhsInfo.isSendable())
-        sendableDep = lhsSendableDep;
-      sendable = false;
-    } else if (!lhsSendableDep && rhsSendableDep) {
-      if (lhsInfo.isSendable())
-        sendableDep = rhsSendableDep;
-      sendable = false;
-    } else {
-      sendable = lhsInfo.isSendable() && rhsInfo.isSendable();
-    }
-
-    // The join has the more restrictive execution semantics.
-    if (lhsExecutionSemanticsDep && rhsExecutionSemanticsDep) {
-      // Form a tuple; it's noncopyable iff either component is noncopyable.
-      SmallVector<TupleTypeElt, 2> elts;
-      elts.push_back(lhsExecutionSemanticsDep);
-      elts.push_back(rhsExecutionSemanticsDep);
-      executionSemanticsDep =
-          TupleType::get(elts, lhsExecutionSemanticsDep->getASTContext());
-    } else if (lhsExecutionSemanticsDep && !rhsExecutionSemanticsDep) {
-      if (rhsInfo.hasCalledAtMostOnceSemantics())
-        executionSemantics = rhsInfo.getExecutionSemantics();
-      else
-        executionSemanticsDep = lhsExecutionSemanticsDep;
-    } else if (!lhsExecutionSemanticsDep && rhsExecutionSemanticsDep) {
-      if (lhsInfo.hasCalledAtMostOnceSemantics())
-        executionSemantics = lhsInfo.getExecutionSemantics();
-      else
-        executionSemanticsDep = rhsExecutionSemanticsDep;
-    } else {
-      // The join suppresses the invertible protocols that either side does.
-      auto inverses =
-          getSuppressedInvertibleProtocols(lhsInfo.getExecutionSemantics());
-      inverses.insertAll(
-          getSuppressedInvertibleProtocols(rhsInfo.getExecutionSemantics()));
-      executionSemantics = getExecutionSemanticsSuppressing(inverses);
-    }
 
     throwing = lhsInfo.isThrowing() || rhsInfo.isThrowing();
     if (throwing) {
@@ -1237,47 +1281,6 @@ extInfoJoinMeetImpl(Operation op,
   } else {
     noEscape = lhsInfo.isNoEscape() && rhsInfo.isNoEscape();
     async = lhsInfo.isAsync() && rhsInfo.isAsync();
-
-    if (lhsSendableDep && rhsSendableDep) {
-      // We cannot represent the meet of two sendable-dependent types.
-      return std::nullopt;
-    } else if (lhsSendableDep && !rhsSendableDep) {
-      if (rhsInfo.isSendable()) {
-        sendable = true;
-      } else {
-        sendable = false;
-        sendableDep = lhsSendableDep;
-      }
-    } else if (!lhsSendableDep && rhsSendableDep) {
-      if (lhsInfo.isSendable()) {
-        sendable = true;
-      } else {
-        sendable = false;
-        sendableDep = rhsSendableDep;
-      }
-    } else {
-      sendable = lhsInfo.isSendable() || rhsInfo.isSendable();
-    }
-
-    // The meet has the less restrictive execution semantics.
-    if (lhsExecutionSemanticsDep && rhsExecutionSemanticsDep) {
-      // We cannot represent the meet of two execution semantics dependent
-      // types.
-      return std::nullopt;
-    } else if (lhsExecutionSemanticsDep && !rhsExecutionSemanticsDep) {
-      if (rhsInfo.hasCalledAtMostOnceSemantics())
-        executionSemanticsDep = lhsExecutionSemanticsDep;
-    } else if (!lhsExecutionSemanticsDep && rhsExecutionSemanticsDep) {
-      if (lhsInfo.hasCalledAtMostOnceSemantics())
-        executionSemanticsDep = rhsExecutionSemanticsDep;
-    } else {
-      // The meet suppresses the invertible protocols that both sides do.
-      auto inverses =
-          getSuppressedInvertibleProtocols(lhsInfo.getExecutionSemantics());
-      inverses.intersect(
-          getSuppressedInvertibleProtocols(rhsInfo.getExecutionSemantics()));
-      executionSemantics = getExecutionSemanticsSuppressing(inverses);
-    }
 
     throwing = lhsInfo.isThrowing() && rhsInfo.isThrowing();
     if (throwing) {
@@ -1302,15 +1305,15 @@ extInfoJoinMeetImpl(Operation op,
   }
 
   // FIXME: Implement everything else!
-  return lhsInfo.intoBuilder()
-      .withNoEscape(noEscape)
-      .withThrows(throwing, thrownError)
-      .withAsync(async)
-      .withSendable(sendable)
-      .withSendableDependentType(sendableDep)
-      .withExecutionSemantics(executionSemantics)
-      .withExecutionSemanticsDependentType(executionSemanticsDep)
-      .build();
+  auto result = lhsInfo.intoBuilder()
+                    .withNoEscape(noEscape)
+                    .withThrows(throwing, thrownError)
+                    .withAsync(async);
+
+  auto combined = joinMeetTypeDependencies(op, lhsInfo, rhsInfo, result);
+  if (!combined)
+    return std::nullopt;
+  return combined->build();
 }
 
 static Type subtypeJoinMeetImpl(Operation op, Type lhs, Type rhs,
@@ -1406,7 +1409,7 @@ static Type subtypeJoinMeetImpl(Operation op, Type lhs, Type rhs,
       auto result = rec(lhsElt, rhsElt);
 
       auto &ctx = lhs->getASTContext();
-      return BoundGenericType::get(ctx.getSetDecl(), Type(), result);
+      return NominalType::get(ctx.getSetDecl(), Type(), result, ctx);
     }
 
     case ConversionBehavior::Double:
@@ -1753,9 +1756,11 @@ Type swift::constraints::subtypeMeet(Type lhs, Type rhs,
 /// This could almost use Type::transformWithPosition(), however that would give
 /// us no way to construct the correct locator.
 static Type openTypeJoinsAndMeetsRec(ConstraintSystem &cs, Type type,
-                                     ConstraintLocatorBuilder locator) {
+                                     ConstraintLocatorBuilder locator,
+                                     bool allowNoEscape) {
   auto rec = [&](Type type, LocatorPathElt elt,
-                 std::optional<LocatorPathElt> secondElt=std::nullopt) -> Type {
+                 bool allowNoEscape = false,
+                 std::optional<LocatorPathElt> secondElt = std::nullopt) -> Type {
     if (!type->hasJoinOrMeet())
       return type;
 
@@ -1763,44 +1768,47 @@ static Type openTypeJoinsAndMeetsRec(ConstraintSystem &cs, Type type,
     return openTypeJoinsAndMeetsRec(cs, type,
                                     (secondElt.has_value()
                                      ? subLocator.withPathElement(*secondElt)
-                                     : subLocator));
+                                     : subLocator),
+                                    allowNoEscape);
   };
 
   if (type->is<MeetType>() || type->is<JoinType>()) {
     unsigned options = TVO_PrefersSubtypeBinding | TVO_CanBindToHole;
+    if (allowNoEscape)
+      options |= TVO_CanBindToNoEscape;
     return cs.createTypeVariable(cs.getConstraintLocator(locator), options);
   }
 
   switch (getConversionBehavior(type)) {
   case ConversionBehavior::Optional: {
     auto result = rec(type->getOptionalObjectType(),
-                      LocatorPathElt::GenericArgument(0));
+                      ConstraintLocator::OptionalPayload);
     return OptionalType::get(result);
   }
 
   case ConversionBehavior::Array: {
-    auto *boundTy = type->castTo<BoundGenericStructType>();
+    auto *boundTy = type->castTo<StructType>();
     auto result = rec(boundTy->getGenericArgs()[0],
                       LocatorPathElt::GenericArgument(0));
     return ArraySliceType::get(result);
   }
 
   case ConversionBehavior::Dictionary: {
-    auto *boundTy = type->castTo<BoundGenericStructType>();
+    auto *boundTy = type->castTo<StructType>();
     auto keyTy = rec(boundTy->getGenericArgs()[0],
-                      LocatorPathElt::GenericArgument(0));
+                     LocatorPathElt::GenericArgument(0));
     auto valueTy = rec(boundTy->getGenericArgs()[1],
                        LocatorPathElt::GenericArgument(1));
     return DictionaryType::get(keyTy, valueTy);
   }
 
   case ConversionBehavior::Set: {
-    auto *boundTy = type->castTo<BoundGenericStructType>();
+    auto *boundTy = type->castTo<StructType>();
     auto eltTy = rec(boundTy->getGenericArgs()[0],
                      LocatorPathElt::GenericArgument(0));
 
     auto &ctx = cs.getASTContext();
-    return BoundGenericType::get(ctx.getSetDecl(), Type(), eltTy);
+    return NominalType::get(ctx.getSetDecl(), Type(), eltTy, ctx);
   }
 
   case ConversionBehavior::Function: {
@@ -1811,9 +1819,11 @@ static Type openTypeJoinsAndMeetsRec(ConstraintSystem &cs, Type type,
 
     SmallVector<AnyFunctionType::Param, 4> params;
     for (unsigned i : indices(funcTy->getParams())) {
+      // Note: This is the only spot where allowNoEscape is true.
       const auto &param = funcTy->getParams()[i];
       auto paramType = rec(param.getPlainType(),
                            LocatorPathElt::FunctionArgument(),
+                           /*allowNoEscape=*/true,
                            LocatorPathElt::TupleElement(i));
       params.push_back(param.withType(paramType));
     }
@@ -1823,6 +1833,7 @@ static Type openTypeJoinsAndMeetsRec(ConstraintSystem &cs, Type type,
       const auto &yield = funcTy->getYields()[i];
       auto yieldType = rec(yield.getType(),
                            LocatorPathElt::FunctionYield(),
+                           /*allowNoEscape=*/false,
                            LocatorPathElt::TupleElement(i));
       yields.push_back(yield.withType(yieldType));
     }
@@ -1865,7 +1876,7 @@ Type swift::constraints::openTypeJoinsAndMeets(ConstraintSystem &cs, Type type,
   // These should never appear at the top level, or we'll enter an infinite loop.
   ASSERT(!type->is<JoinType>() && !type->is<MeetType>());
 
-  return openTypeJoinsAndMeetsRec(cs, type, locator);
+  return openTypeJoinsAndMeetsRec(cs, type, locator, /*allowNoEscape=*/false);
 }
 
 bool swift::constraints::isPackExpansionType(Type type) {

@@ -98,7 +98,13 @@ class Traversal : public TypeVisitor<Traversal, bool>
 
   bool visitNominalType(NominalType *ty) {
     if (auto parent = ty->getParent())
-      return doIt(parent);
+      if (doIt(parent))
+        return true;
+
+    for (auto arg : ty->getGenericArgs())
+      if (doIt(arg))
+        return true;
+
     return false;
   }
 
@@ -127,13 +133,8 @@ class Traversal : public TypeVisitor<Traversal, bool>
         return true;
     }
 
-    if (auto sendableDep = ty->getSendableDependentType()) {
-      if (doIt(sendableDep))
-        return true;
-    }
-
-    if (auto executionSemanticsDep = ty->getExecutionSemanticsDependentType()) {
-      if (doIt(executionSemanticsDep))
+    for (auto dependentType : ty->getTypeDependencies()) {
+      if (doIt(dependentType.getPointer()))
         return true;
     }
 
@@ -241,18 +242,6 @@ class Traversal : public TypeVisitor<Traversal, bool>
   bool visitUnboundGenericType(UnboundGenericType *ty) {
     if (auto parent = ty->getParent())
       return doIt(parent);
-    return false;
-  }
-
-  bool visitBoundGenericType(BoundGenericType *ty) {
-    if (auto parent = ty->getParent())
-      if (doIt(parent))
-        return true;
-
-    for (auto arg : ty->getGenericArgs())
-      if (doIt(arg))
-        return true;
-
     return false;
   }
 

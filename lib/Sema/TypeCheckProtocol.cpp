@@ -118,13 +118,10 @@ getTypesToCompare(ValueDecl *reqt, Type reqtType, bool reqtTypeIsIUO,
     // function type not in a parameter is, more or less, implicitly @escaping.
     // For Sendable, we want to behave as though it was not necessary because
     // function types that aren't in a parameter can be Sendable or not.
-    // For `@called(atMostOnce)`, we want to behave as though it was not
-    // necessary because function types that aren't in a parameter can be
-    // called once or not.
-    // For `@called(atMostOnce)`, we want to behave as though it was necessary,
-    // just like noescape, because a plain function type can always satisfy a
-    // `@called(atMostOnce)` requirement but a `@called(atMostOnce)` function
-    // type cannot satisfy a plain one.
+    // For execution semantics, we want to behave as though it was necessary,
+    // just like noescape, because a plain function type can always satisfy an
+    // at-most-once requirement, but an at-most-once function type can't
+    // satisfy a plain one.
     // FIXME: Should we check for a Sendable bound on the requirement type?
     bool inRequirement =
         (adjustment != TypeAdjustment::NoescapeToEscaping &&
@@ -981,6 +978,7 @@ RequirementMatch swift::matchWitness(
       }
 
       // Check that lifetime dependencies match
+      // TODO: Also check scopes eventually.
       if (auto result = matchLifetimes(
               LifetimeDependentInterface::fromValueDecl(witness, witnessFnType),
               LifetimeDependentInterface::fromValueDecl(req, reqFnType))) {
@@ -3825,6 +3823,30 @@ ConformanceChecker::checkActorIsolation(ValueDecl *requirement,
       if (!isThrowsDecl(requirement))
         missingOptions |= MissingFlags::RequirementThrows;
 
+      // A remote call can fail with any error, which the distributed thunk
+      // throws, so the requirement must throw 'any Error' rather than a
+      // typed error, like 'throws(Never)'. A thrown error type which depends
+      // on the conformance, like 'throws(Self.Failure)', is left to the
+      // matching of the witness
+      if (isDistributedDecl(witness) && isThrowsDecl(requirement)) {
+        // The declared thrown type, which is null for an untyped 'throws'.
+        // Unlike the effective thrown type, it is 'Never' for 'throws(Never)'
+        AbstractFunctionDecl *reqFunc =
+            dyn_cast<AbstractFunctionDecl>(requirement);
+        if (!reqFunc)
+          if (auto *storage = dyn_cast<AbstractStorageDecl>(requirement))
+            reqFunc = storage->getEffectfulGetAccessor();
+        Type thrownTy = reqFunc ? reqFunc->getThrownInterfaceType() : Type();
+        ASTContext &ctx = DC->getASTContext();
+        if (thrownTy && !thrownTy->hasTypeParameter() &&
+            !thrownTy->isEqual(ctx.getErrorExistentialType())) {
+          ctx.Diags.diagnose(witness,
+                             diag::distributed_witness_typed_throws_requirement,
+                             witness, requirement, thrownTy);
+          return std::nullopt;
+        }
+      }
+
       // If the witness is distributed, it is able to witness a requirement
       // only if the requirement is `async throws`.
       if (!isDistributedDecl(witness) && !missingOptions)
@@ -4775,6 +4797,15 @@ ConformanceChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
           });
         });
       }
+    }
+
+    if (requirement->isObjC()) {
+      getASTContext().addDelayedConformanceDiag(
+          Conformance, /*isError=*/false,
+          [witness, requirement](NormalProtocolConformance *conformance) {
+            diagnoseImplicitForceUnwrapOfIUOParams(witness, requirement,
+                                                   /*isWitness=*/true);
+          });
     }
 
     auto check = checkWitness(requirement, best);
@@ -8010,7 +8041,8 @@ bool swift::forEachConformance(
       type = sugarType->getImplementationType();
     }
 
-    if (auto boundGeneric = dyn_cast<BoundGenericType>(type.getPointer())) {
+    if (auto boundGeneric = dyn_cast<NominalType>(type.getPointer());
+        boundGeneric && boundGeneric->hasGenericArgs()) {
       auto subs = boundGeneric->getContextSubstitutionMap();
       if (forEachConformance(subs, body, visitedConformances))
         return true;

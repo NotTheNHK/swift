@@ -1078,7 +1078,7 @@ ConstraintSystem::getExprDepthAndParent(Expr *expr) {
 
 std::optional<std::pair<Type, Type>>
 ConstraintSystem::isDictionaryType(Type type) {
-  if (auto boundStruct = type->getAs<BoundGenericStructType>()) {
+  if (auto boundStruct = type->getAs<StructType>()) {
     if (boundStruct->getDecl() == type->getASTContext().getDictionaryDecl()) {
       auto genericArgs = boundStruct->getGenericArgs();
       return std::make_pair(genericArgs[0], genericArgs[1]);
@@ -1089,7 +1089,7 @@ ConstraintSystem::isDictionaryType(Type type) {
 }
 
 std::optional<Type> ConstraintSystem::isSetType(Type type) {
-  if (auto boundStruct = type->getAs<BoundGenericStructType>()) {
+  if (auto boundStruct = type->getAs<StructType>()) {
     if (boundStruct->getDecl() == type->getASTContext().getSetDecl())
       return boundStruct->getGenericArgs()[0];
   }
@@ -1443,8 +1443,10 @@ FunctionType::ExtInfo ClosureEffectsRequest::evaluate(
   bool sendable = expr->getAttrs().hasAttribute<SendableAttr>();
   std::optional<ExecutionSemantics> executionSemantics;
 
-  if (auto *called = expr->getAttrs().getAttribute<CalledAttr>()) {
-    executionSemantics = called->getSemantics();
+  if (auto *attr = getExecutionSemanticsAttr(expr->getAttrs(),
+                                             expr->getASTContext().SourceMgr)) {
+    executionSemantics = isa<OnceAttr>(attr) ? ExecutionSemantics::Once
+                                             : ExecutionSemantics::AtMostOnce;
   }
 
   if (throws || async) {
@@ -1532,9 +1534,9 @@ void ConstraintSystem::buildDisjunctionForOptionalVsUnderlying(
     // future optional, and add a constraint between `ty` and `underlyingType`
     // to model it.
     underlyingType = createTypeVariable(
-        getConstraintLocator(locator, LocatorPathElt::GenericArgument(0)),
+        getConstraintLocator(locator, ConstraintLocator::OptionalPayload),
         TVO_PrefersSubtypeBinding | TVO_CanBindToLValue |
-            TVO_CanBindToNoEscape);
+        TVO_CanBindToNoEscape);
 
     // Using a `typeVar` here because l-value is going to be applied
     // to the underlying type below.
@@ -1762,29 +1764,25 @@ struct TypeSimplifier : public TypeTransform<TypeSimplifier> {
     return std::nullopt;
   }
 
-  std::pair<Type, /*sendable*/ bool> transformSendableDependentType(Type ty) {
+  Type transformTypeDependency(TypeDependenceKind kind, Type ty,
+                               ASTExtInfoBuilder &extInfo) {
     ty = simplify(ty);
 
     // If we still have type variables, we keep the dependence.
     if (ty->hasTypeVariable())
-      return std::pair(ty, false);
+      return ty;
 
-    // Otherwise we've flattened the dependence, evaluate Sendable.
-    return std::make_pair(Type(), isSendableCapture(ty));
-  }
-
-  std::pair<Type, std::optional<ExecutionSemantics>>
-  transformExecutionSemanticsDependentType(Type ty) {
-    ty = simplify(ty);
-
-    // If we still have type variables, we keep the dependence.
-    if (ty->hasTypeVariable())
-      return std::make_pair(ty, std::nullopt);
-
-    // Otherwise we've flattened the dependence, evaluate @called(atMostOnce).
-    if (ty->isNoncopyable())
-      return std::make_pair(Type(), ExecutionSemantics::AtMostOnce);
-    return std::make_pair(Type(), std::nullopt);
+    // Otherwise we've flattened the dependence, evaluate the property.
+    switch (kind) {
+    case TypeDependenceKind::Sendable:
+      extInfo = extInfo.withSendable(isSendableCapture(ty));
+      break;
+    case TypeDependenceKind::ExecutionSemantics:
+      extInfo = extInfo.withExecutionSemantics(
+          getUnappliedConsumingMethodExecutionSemantics(ty));
+      break;
+    }
+    return Type();
   }
 };
 
@@ -3830,6 +3828,7 @@ void constraints::simplifyLocator(ASTNode &anchor,
     case ConstraintLocator::ProtocolCompositionMemberType:
       break;
 
+    case ConstraintLocator::OptionalPayload:
     case ConstraintLocator::GenericArgument:
     case ConstraintLocator::FunctionArgument:
     case ConstraintLocator::SynthesizedArgument:
@@ -4450,6 +4449,7 @@ bool ConstraintSystem::isArgumentOfImportedDecl(
     // either value-to-optional promotion or optional-to-optional
     // conversion.
     if (last.is<LocatorPathElt::OptionalInjection>() ||
+        last.is<LocatorPathElt::OptionalPayload>() ||
         last.is<LocatorPathElt::GenericArgument>()) {
       path.pop_back();
       continue;
@@ -5329,6 +5329,18 @@ bool constraints::isSendableCapture(Type type) {
     }
     return false;
   });
+}
+
+std::optional<ExecutionSemantics>
+constraints::getUnappliedConsumingMethodExecutionSemantics(Type baseType) {
+  ASSERT(!baseType->hasTypeVariable());
+
+  InvertibleProtocolSet inverses;
+  if (baseType->isNoncopyable())
+    inverses.insert(InvertibleProtocolKind::Copyable);
+  if (!baseType->isDeinitable())
+    inverses.insert(InvertibleProtocolKind::Deinitable);
+  return getExecutionSemanticsSuppressing(inverses);
 }
 
 ASTNode constraints::findAsyncNode(ClosureExpr *closure) {

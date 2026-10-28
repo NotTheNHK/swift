@@ -172,6 +172,9 @@ param
   # CMake
   [string] $CMakeVersion = "4.4.1",
 
+  # Ninja
+  [string] $NinjaVersion = "1.13.2",
+
   # Dependency Download Retries
   [ValidateRange(1, [int]::MaxValue)]
   [int] $DownloadRetryCount = 3,
@@ -183,6 +186,7 @@ param
   # Dependencies
   [ValidatePattern('^\d+(\.\d+)*$')]
   [string] $PythonVersion = "3.10.1",
+  [switch] $DependenciesOnly = $False,
 
   # Toolchain Version Info
   [string] $ProductVersion = "0.0.0",
@@ -626,6 +630,25 @@ $KnownCMakes = @{
   }
 }
 
+$KnownNinjas = @{
+  "1.13.2" = @{
+    AMD64 = @{
+      Artifact = "ninja-1.13.2-windows-amd64"
+      URL = "https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-win.zip"
+      SHA256 = "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65"
+      FileName = "ninja-win.zip"
+      Path = [IO.Path]::Combine("$ArtifactCache", "ninja-1.13.2-windows-amd64", "ninja.exe")
+    };
+    ARM64 = @{
+      Artifact = "ninja-1.13.2-windows-arm64"
+      URL = "https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-winarm64.zip"
+      SHA256 = "E52F0BDEF9DFB1003229DBD6508A508C4073FD017247002ADC66E5E806CB0391"
+      FileName = "ninja-winarm64.zip"
+      Path = [IO.Path]::Combine("$ArtifactCache", "ninja-1.13.2-windows-arm64", "ninja.exe")
+    };
+  }
+}
+
 $BuildArchName = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
 # TODO: Support other cross-compilation scenarios.
 $BuildOS = [OS]::Windows
@@ -634,19 +657,6 @@ $HostOS = [OS]::Windows
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $VSInstallRoot = & $vswhere -nologo -latest -products "*" -all -prerelease -property installationPath
 $msbuild = "$VSInstallRoot\MSBuild\Current\Bin\$BuildArchName\MSBuild.exe"
-
-function Get-Ninja {
-  try {
-    return (Get-Command "Ninja.exe" -ErrorAction Stop).Source
-  } catch {
-      if (Test-Path -Path "${VSInstallRoot}\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja" -PathType Container) {
-        return "${VSInstallRoot}\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
-      }
-  }
-  throw "Ninja not found on Path nor in the Visual Studio Installation. Please Install Ninja to continue."
-}
-
-$ninja = Get-Ninja
 
 $NugetRoot = "$ArtifactCache\nuget"
 
@@ -712,6 +722,21 @@ $WindowsSDKBuilds = @($WindowsSDKArchitectures | ForEach-Object {
 $TimingData = New-Object System.Collections.Generic.List[System.Object]
 $CurrentOperation = $null
 
+if ($Summary) {
+  Add-Type -Namespace Win32 -Name Kernel32 -MemberDefinition @"
+[DllImport("kernel32.dll")]
+public static extern bool GetSystemTimes(out long lpIdleTime, out long lpKernelTime, out long lpUserTime);
+"@
+}
+
+# Returns the time all processors have spent busy and idle since boot.
+function Get-ProcessorTimes {
+  $IdleTime = $KernelTime = $UserTime = [long] 0
+  $null = [Win32.Kernel32]::GetSystemTimes([ref] $IdleTime, [ref] $KernelTime, [ref] $UserTime)
+  # The kernel time includes the idle time.
+  return @{ Busy = $KernelTime + $UserTime - $IdleTime; Idle = $IdleTime }
+}
+
 function Add-TimingData {
   param
   (
@@ -727,6 +752,7 @@ function Add-TimingData {
     Platform = $Platform.OS.ToString()
     "Build Step" = $BuildStep
     "Elapsed Time" = [TimeSpan]::Zero
+    CPU = 0
     Parent = $Parent
     Children = @()
   }
@@ -755,6 +781,7 @@ function Record-OperationTime {
   }
 
   $Stopwatch = [Diagnostics.Stopwatch]::StartNew()
+  $StartTimes = Get-ProcessorTimes
   $TimingEntry = Add-TimingData $Platform $BuildStep $script:CurrentOperation
   $script:CurrentOperation = $TimingEntry
 
@@ -762,7 +789,11 @@ function Record-OperationTime {
     & $ScriptBlock
   } finally {
     $Stopwatch.Stop()
+    $EndTimes = Get-ProcessorTimes
+    $BusyTime = $EndTimes.Busy - $StartTimes.Busy
+    $TotalTime = $BusyTime + $EndTimes.Idle - $StartTimes.Idle
     $TimingEntry."Elapsed Time" = $Stopwatch.Elapsed
+    $TimingEntry.CPU = if ($TotalTime -gt 0) { $BusyTime / $TotalTime } else { 0 }
     $script:CurrentOperation = $TimingEntry.Parent
   }
 }
@@ -786,6 +817,7 @@ function Flatten-TimingEntry {
     Arch = $Entry.Arch
     "Elapsed Time" = $FormattedTime
     "%" = "$Percentage%"
+    CPU = "$([math]::Round($Entry.CPU * 100))%"
   }
 
   $SortedChildren = $Entry.Children | Sort-Object -Descending -Property "Elapsed Time"
@@ -798,9 +830,11 @@ function Write-Summary {
   Write-Host "Summary:" -ForegroundColor Cyan
 
   $TotalTime = [TimeSpan]::Zero
+  $BusySeconds = 0
   foreach ($Entry in $TimingData) {
     if (-not $Entry.Parent) {
       $TotalTime = $TotalTime.Add($Entry."Elapsed Time")
+      $BusySeconds += $Entry.CPU * $Entry."Elapsed Time".TotalSeconds
     }
   }
 
@@ -816,6 +850,7 @@ function Write-Summary {
     Arch = ""
     "Elapsed Time" = $FormattedTotalTime
     "%" = "100.0%"
+    CPU = "$([math]::Round($BusySeconds / $TotalTime.TotalSeconds * 100))%"
   }
 
   @($Result) + $TotalRow | Format-Table -AutoSize
@@ -861,6 +896,10 @@ function Get-Syft {
 
 function Get-CMake {
   return $KnownCMakes[$CMakeVersion][$BuildArchName]
+}
+
+function Get-Ninja {
+  return $KnownNinjas[$NinjaVersion][$BuildArchName]
 }
 
 function Get-InstallDir([Hashtable] $Platform) {
@@ -1863,6 +1902,12 @@ function Get-Dependencies {
     Expand-ArtifactZip $CMake.FileName $CMake.Artifact
     Write-Success "CMake $CMakeVersion"
 
+    # Install Ninja.
+    $Ninja = Get-Ninja
+    DownloadAndVerify $Ninja.URL "$ArtifactCache\$($Ninja.FileName)" $Ninja.SHA256
+    Expand-ArtifactZip $Ninja.FileName $Ninja.Artifact
+    Write-Success "Ninja $NinjaVersion"
+
     if ($Android) {
       $NDK = Get-AndroidNDK
       DownloadAndVerify $NDK.URL "$ArtifactCache\android-ndk-$AndroidNDKVersion-windows.zip" $NDK.SHA256
@@ -2556,7 +2601,7 @@ function Build-CMakeProject {
       Add-KeyValueIfNew $Defines CMAKE_INSTALL_PREFIX $InstallTo
     }
 
-    Add-KeyValueIfNew $Defines CMAKE_MAKE_PROGRAM "$ninja"
+    Add-KeyValueIfNew $Defines CMAKE_MAKE_PROGRAM "$((Get-Ninja).Path)"
 
     # Generate the project
     $cmakeGenerateArgs = @("-B", $Bin, "-S", $Src, "-G", $Generator)
@@ -4993,7 +5038,7 @@ function Test-LLBuild([Hashtable] $Platform) {
   # Build additional llvm executables needed by tests
   Invoke-IsolatingEnvVars {
     Invoke-VsDevShell $BuildPlatform
-    Invoke-Program $ninja -C (Get-ProjectBinaryCache $BuildPlatform BuildTools) FileCheck not
+    Invoke-Program (Get-Ninja).Path -C (Get-ProjectBinaryCache $BuildPlatform BuildTools) FileCheck not
   }
 
   Invoke-IsolatingEnvVars {
@@ -5910,6 +5955,10 @@ function Copy-BuildArtifactsToStage([Hashtable] $Platform) {
 try {
 
 Get-Dependencies
+
+if ($DependenciesOnly) {
+  exit 0;
+}
 
 if ($Clean) {
   # Fail instead of leaving a partially-cleaned tree behind.

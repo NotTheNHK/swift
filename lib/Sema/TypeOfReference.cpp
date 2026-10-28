@@ -107,7 +107,7 @@ Type ConstraintSystem::openUnboundGenericType(GenericTypeDecl *decl,
   // FIXME: For some reason we can end up with unbound->getDecl()
   // pointing at a generic TypeAliasDecl here. If we find a way to
   // handle generic TypeAliases elsewhere, this can just become a
-  // call to BoundGenericType::get().
+  // call to NominalType::get().
   auto result =
       TypeResolution::forInterface(
           DC, std::nullopt,
@@ -238,13 +238,16 @@ public:
     openReqs(D, QuerySubstitutionMap{subs});
   }
 
-  Type transformBoundGenericType(BoundGenericType *genericTy) {
+  Type transformGenericType(NominalType *genericTy) {
+    assert(genericTy->hasGenericArgs());
+
     SmallVector<Type, 4> genericArgs;
     for (auto arg : genericTy->getGenericArgs())
       genericArgs.push_back(transform(arg));
 
-    auto substTy = BoundGenericType::get(
-        genericTy->getDecl(), transform(genericTy->getParent()), genericArgs);
+    auto substTy = NominalType::get(
+        genericTy->getDecl(), transform(genericTy->getParent()), genericArgs,
+        cs.getASTContext());
 
     openGenericTypeRequirements(substTy->getDecl(),
                                 substTy->getContextSubstitutionMap());
@@ -321,8 +324,9 @@ public:
         return transformUnboundGenericType(unbound);
       if (auto *placeholderTy = dyn_cast<PlaceholderType>(tyPtr))
         return transformPlaceholderType(placeholderTy);
-      if (auto *genericTy = dyn_cast<BoundGenericType>(tyPtr))
-        return transformBoundGenericType(genericTy);
+      if (auto *genericTy = dyn_cast<NominalType>(tyPtr);
+          genericTy && genericTy->hasGenericArgs())
+        return transformGenericType(genericTy);
       if (auto *aliasTy = dyn_cast<TypeAliasType>(tyPtr))
         return transformTypeAliasType(aliasTy);
       if (auto *errTy = dyn_cast<ErrorType>(tyPtr))
@@ -1044,7 +1048,8 @@ FunctionType *ConstraintSystem::adjustFunctionTypeForConcurrency(
           sendableDepTy = simplifyType(sendableDepTy);
           auto extInfo = referenceTy->getExtInfo();
           if (sendableDepTy->hasTypeVariable()) {
-            extInfo = extInfo.withSendableDependentType(sendableDepTy);
+            extInfo = extInfo.withTypeDependency(TypeDependenceKind::Sendable,
+                                                 sendableDepTy);
           } else {
             extInfo = extInfo.withSendable(isSendableCapture(sendableDepTy));
           }
@@ -2069,9 +2074,9 @@ ConstraintSystem::getTypeOfMemberReferencePre(
     }
   }
 
-  // Member type could be `@called(atMostOnce)` if the method is consuming and
-  // base is non-Copyable.
-  if (Context.LangOpts.hasFeature(Feature::CalledAttribute)) {
+  // Member type could be at-most-once or exactly-once if the method is
+  // consuming and base is non-Copyable.
+  if (Context.LangOpts.hasFeature(Feature::OnceFunctions)) {
     if (auto *method = dyn_cast<FuncDecl>(value);
         method && method->isInstanceMethod() && method->getSelfAccessKind() == SelfAccessKind::Consuming) {
       auto *fullTy = openedType->castTo<FunctionType>();
@@ -2079,11 +2084,11 @@ ConstraintSystem::getTypeOfMemberReferencePre(
 
       std::optional<AnyFunctionType::ExtInfo> newExtInfo;
       if (baseObjTy->hasTypeVariable())
-        newExtInfo = methodTy->getExtInfo().withExecutionSemanticsDependentType(
-            baseObjTy);
-      else if (baseObjTy->isNoncopyable())
-        newExtInfo = methodTy->getExtInfo().withExecutionSemantics(
-            ExecutionSemantics::AtMostOnce);
+        newExtInfo = methodTy->getExtInfo().withTypeDependency(
+            TypeDependenceKind::ExecutionSemantics, baseObjTy);
+      else if (auto semantics =
+                   getUnappliedConsumingMethodExecutionSemantics(baseObjTy))
+        newExtInfo = methodTy->getExtInfo().withExecutionSemantics(semantics);
 
       if (newExtInfo) {
         auto *newMethodTy = methodTy->withExtInfo(*newExtInfo);
@@ -2462,9 +2467,9 @@ void ConstraintSystem::bindOverloadType(const SelectedOverload &overload,
       assert(paramTy->isKnownKeyPathType());
     }
 
-    auto keyPathTy = paramTy->castTo<BoundGenericType>();
+    auto keyPathTy = paramTy->castTo<NominalType>();
 
-    auto *keyPathDecl = keyPathTy->getAnyNominal();
+    auto *keyPathDecl = keyPathTy->getDecl();
     assert(keyPathTy->isKnownKeyPathType() &&
            "parameter is supposed to be a keypath");
 
@@ -2699,6 +2704,17 @@ isInvalidPartialApplication(ConstraintSystem &cs,
   return {true, getApplicationLevel(cs, baseTy, UDE)};
 }
 
+/// The isolation of the function types that the special type checking
+/// semantics build: nonisolated, or nonisolated(nonsending) when that is the
+/// default.
+static FunctionTypeIsolation
+getDefaultFunctionTypeIsolation(ConstraintSystem &CS) {
+  if (CS.getASTContext().LangOpts.hasFeature(
+          Feature::NonisolatedNonsendingByDefault))
+    return FunctionTypeIsolation::forNonisolatedNonsending();
+  return FunctionTypeIsolation::forNonIsolated();
+}
+
 /// If we're resolving an overload set with a decl that has special type
 /// checking semantics, compute the type of the reference.  For now, follow
 /// the lead of \c getTypeOfMemberReference and return a pair of
@@ -2755,11 +2771,7 @@ static Type getTypeOfReferenceWithSpecialTypeCheckingSemantics(
         0, preparedOverload);
     FunctionType::Param arg(escapeClosure);
 
-    auto bodyParamIsolation = FunctionTypeIsolation::forNonIsolated();
-    if (CS.getASTContext().LangOpts.hasFeature(
-            Feature::NonisolatedNonsendingByDefault)) {
-      bodyParamIsolation = FunctionTypeIsolation::forNonisolatedNonsending();
-    }
+    auto bodyParamIsolation = getDefaultFunctionTypeIsolation(CS);
 
     auto bodyClosure = FunctionType::get(arg, /* yields */ {}, result,
                                          FunctionType::ExtInfoBuilder()
@@ -2773,16 +2785,60 @@ static Type getTypeOfReferenceWithSpecialTypeCheckingSemantics(
       FunctionType::Param(bodyClosure, CS.getASTContext().getIdentifier("do")),
     };
 
-    auto withoutEscapingIsolation = FunctionTypeIsolation::forNonIsolated();
-    if (CS.getASTContext().LangOpts.hasFeature(
-            Feature::NonisolatedNonsendingByDefault)) {
-      withoutEscapingIsolation = FunctionTypeIsolation::forNonisolatedNonsending();
-    }
+    auto withoutEscapingIsolation = getDefaultFunctionTypeIsolation(CS);
 
     return FunctionType::get(args, /* yields */ {}, result,
                              FunctionType::ExtInfoBuilder()
                                  .withNoEscape(false)
                                  .withIsolation(withoutEscapingIsolation)
+                                 .withAsync(true)
+                                 .withThrows(true, thrownError)
+                                 .build());
+  }
+  case DeclTypeCheckingSemantics::WithoutActuallyDiscarding: {
+    // Proceed with a "WithoutActuallyDiscarding" operation. The body closure
+    // receives the exactly-once argument converted to an at-most-once
+    // function. The body parameter is escaping if the argument is.
+    auto exactlyOnceClosure = CS.createTypeVariable(
+        CS.getConstraintLocator(locator, ConstraintLocator::FunctionArgument),
+        TVO_CanBindToNoEscape, preparedOverload);
+    auto atMostOnceClosure = CS.createTypeVariable(
+        CS.getConstraintLocator(locator, ConstraintLocator::FunctionArgument),
+        TVO_CanBindToNoEscape, preparedOverload);
+    CS.addConstraint(ConstraintKind::DiscardableFunctionOf, atMostOnceClosure,
+                     exactlyOnceClosure, CS.getConstraintLocator(locator),
+                     /*isFavored=*/false, preparedOverload);
+    auto result = CS.createTypeVariable(
+        CS.getConstraintLocator(locator, ConstraintLocator::FunctionResult),
+        TVO_CanBindToNoEscape, preparedOverload);
+    auto thrownError = CS.createTypeVariable(
+        CS.getConstraintLocator(locator, ConstraintLocator::ThrownErrorType), 0,
+        preparedOverload);
+    auto consuming =
+        ParameterTypeFlags().withOwnershipSpecifier(ParamSpecifier::Consuming);
+    FunctionType::Param arg(atMostOnceClosure, Identifier(), consuming);
+
+    auto bodyParamIsolation = getDefaultFunctionTypeIsolation(CS);
+
+    auto bodyClosure = FunctionType::get(arg, /* yields */ {}, result,
+                                         FunctionType::ExtInfoBuilder()
+                                             .withNoEscape(true)
+                                             .withIsolation(bodyParamIsolation)
+                                             .withAsync(true)
+                                             .withThrows(true, thrownError)
+                                             .build());
+    FunctionType::Param args[] = {
+        FunctionType::Param(exactlyOnceClosure, Identifier(), consuming),
+        FunctionType::Param(bodyClosure,
+                            CS.getASTContext().getIdentifier("do")),
+    };
+
+    auto withoutDiscardingIsolation = getDefaultFunctionTypeIsolation(CS);
+
+    return FunctionType::get(args, /* yields */ {}, result,
+                             FunctionType::ExtInfoBuilder()
+                                 .withNoEscape(false)
+                                 .withIsolation(withoutDiscardingIsolation)
                                  .withAsync(true)
                                  .withThrows(true, thrownError)
                                  .build());
@@ -2807,11 +2863,7 @@ static Type getTypeOfReferenceWithSpecialTypeCheckingSemantics(
         0, preparedOverload);
     FunctionType::Param bodyArgs[] = {FunctionType::Param(openedTy)};
 
-    auto bodyParamIsolation = FunctionTypeIsolation::forNonIsolated();
-    if (CS.getASTContext().LangOpts.hasFeature(
-            Feature::NonisolatedNonsendingByDefault)) {
-      bodyParamIsolation = FunctionTypeIsolation::forNonisolatedNonsending();
-    }
+    auto bodyParamIsolation = getDefaultFunctionTypeIsolation(CS);
 
     auto bodyClosure = FunctionType::get(bodyArgs, /* yields */ {}, result,
                                          FunctionType::ExtInfoBuilder()
@@ -2825,11 +2877,7 @@ static Type getTypeOfReferenceWithSpecialTypeCheckingSemantics(
       FunctionType::Param(bodyClosure, CS.getASTContext().getIdentifier("do")),
     };
 
-    auto openExistentialIsolation = FunctionTypeIsolation::forNonIsolated();
-    if (CS.getASTContext().LangOpts.hasFeature(
-            Feature::NonisolatedNonsendingByDefault)) {
-      openExistentialIsolation = FunctionTypeIsolation::forNonisolatedNonsending();
-    }
+    auto openExistentialIsolation = getDefaultFunctionTypeIsolation(CS);
 
     return FunctionType::get(args, /* yields */ {}, result,
                              FunctionType::ExtInfoBuilder()

@@ -2357,7 +2357,8 @@ namespace {
         Type baseTy;
         bool resultIsLValue;
         
-        if (auto nom = keyPathTy->getAs<NominalType>()) {
+        if (auto nom = keyPathTy->getAs<NominalType>();
+            nom && !nom->hasGenericArgs()) {
           // AnyKeyPath is <T> rvalue T -> rvalue Any?
           if (nom->isAnyKeyPath()) {
             valueTy = ctx.getAnyExistentialType();
@@ -2389,7 +2390,7 @@ namespace {
             ASSERT(keyPathTy);
           }
 
-          auto keyPathBGT = keyPathTy->castTo<BoundGenericType>();
+          auto keyPathBGT = keyPathTy->castTo<NominalType>();
           baseTy = keyPathBGT->getGenericArgs()[0];
 
           // Coerce the index to the key path's type
@@ -3906,7 +3907,7 @@ namespace {
 
       if (arrayTy->isInlineArray() || arrayTy->is_InlineArray()) {
         // <let count: Int, Element>
-        elementType = arrayTy->castTo<BoundGenericStructType>()->getGenericArgs()[1];
+        elementType = arrayTy->castTo<StructType>()->getGenericArgs()[1];
       } else {
         ProtocolDecl *arrayProto = TypeChecker::getProtocol(
             ctx, expr->getLoc(), KnownProtocolKind::ExpressibleByArrayLiteral);
@@ -5192,10 +5193,10 @@ namespace {
         isFunctionType = true;
       } else if (auto *existential = exprType->getAs<ExistentialType>()) {
         auto layout = existential->getExistentialLayout();
-        auto keyPathTy = layout.explicitSuperclass->castTo<BoundGenericType>();
+        auto keyPathTy = layout.explicitSuperclass->castTo<NominalType>();
         leafTy = keyPathTy->getGenericArgs()[1];
       } else {
-        auto keyPathTy = exprType->castTo<BoundGenericType>();
+        auto keyPathTy = exprType->castTo<NominalType>();
         leafTy = keyPathTy->getGenericArgs()[1];
       }
 
@@ -5278,7 +5279,8 @@ namespace {
             resolvedComponents.push_back(
                 KeyPathExpr::Component::forOptionalForce(objectTy, loc));
           } else {
-            buildKeyPathOptionalForceComponent(resolvedComponents);
+            buildKeyPathOptionalForceComponent(resolvedComponents,
+                                               origComponent.getLoc());
           }
           break;
         }
@@ -5346,7 +5348,8 @@ namespace {
       // Compute KeyPath<baseTy, leafTy> and set E's type back to it.
       auto kpDecl = ctx.getKeyPathDecl();
       auto keyPathTy =
-          BoundGenericType::get(kpDecl, nullptr, { baseTy, kpResultTy });
+          NominalType::get(kpDecl, nullptr, { baseTy, kpResultTy },
+                           cs.getASTContext());
       E->setType(keyPathTy);
       cs.cacheType(E);
 
@@ -5429,8 +5432,14 @@ namespace {
       return coerceToType(captureExpr, exprType, cs.getConstraintLocator(E));
     }
 
+    /// Add an optional-force component that unwraps the last component.
+    ///
+    /// \param bangLoc The location of an explicit '!'. Implicit forces of
+    /// implicitly unwrapped optionals take the location of the component they
+    /// unwrap.
     void buildKeyPathOptionalForceComponent(
-        SmallVectorImpl<KeyPathExpr::Component> &components) {
+        SmallVectorImpl<KeyPathExpr::Component> &components,
+        SourceLoc bangLoc = SourceLoc()) {
       assert(!components.empty());
 
       // Unwrap the last component type, preserving @lvalue-ness.
@@ -5444,7 +5453,7 @@ namespace {
       }
       assert(objectTy);
 
-      auto loc = components.back().getLoc();
+      auto loc = bangLoc.isValid() ? bangLoc : components.back().getLoc();
       components.push_back(
           KeyPathExpr::Component::forOptionalForce(objectTy, loc));
     }
@@ -7016,8 +7025,8 @@ Expr *ExprRewriter::buildCollectionUpcastExpr(
     return expr;
 
   // Build the first value conversion.
-  auto fromArgs = cs.getType(expr)->castTo<BoundGenericType>()->getGenericArgs();
-  auto toArgs = toType->castTo<BoundGenericType>()->getGenericArgs();
+  auto fromArgs = cs.getType(expr)->castTo<NominalType>()->getGenericArgs();
+  auto toArgs = toType->castTo<NominalType>()->getGenericArgs();
   auto conv =
     buildOpaqueElementConversion(*this, expr->getLoc(),
                                  fromArgs[0], toArgs[0],
@@ -7286,6 +7295,13 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
           return cs.cacheType(new (ctx) UnsafeCastExpr(expr, toType));
       }
 
+      // TODO: Record the relationship between scopes instead.
+      // FIXME: Lvalues and function conversions equal up to scopes
+      // aren't coersed so they crash in the AST verifier / SILGen.
+      if (ctx.LangOpts.hasFeature(Feature::ScopeRestrictions) &&
+          eraseScopes(fromType)->isEqual(eraseScopes(toType)))
+        return cs.cacheType(new (ctx) UnsafeCastExpr(expr, toType));
+
       auto &err = llvm::errs();
       err << "fromType->getCanonicalType() = ";
       fromType->getCanonicalType()->dump(err);
@@ -7321,7 +7337,7 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
     }
         
     case ConversionRestrictionKind::ValueToOptional: {
-      auto toGenericType = toType->castTo<BoundGenericType>();
+      auto toGenericType = toType->castTo<EnumType>();
       assert(toGenericType->getDecl()->isOptionalDecl());
       TypeChecker::requireOptionalIntrinsics(ctx, expr->getLoc());
 
@@ -7683,7 +7699,6 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
   // FIXME: Can we rig things up so that we always have a Superclass
   // conversion restriction in this case?
   case TypeKind::DynamicSelf:
-  case TypeKind::BoundGenericClass:
   case TypeKind::Class: {
     if (!toType->getClassDecl())
       break;
@@ -7893,7 +7908,7 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
     }
 
     // If we have a ClosureExpr, then we can safely propagate the
-    // '@called(atMostOnce)' bit to the closure without invalidating prior
+    // at-most-once bit to the closure without invalidating prior
     // analysis.
     fromEI = fromFunc->getExtInfo();
     if (toEI.hasCalledAtMostOnceSemantics() &&
@@ -7903,7 +7918,7 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
       if (applyTypeToClosureExpr(cs, expr, newFromFuncType)) {
         fromFunc = newFromFuncType->castTo<FunctionType>();
 
-        // Propagating '@called(atMostOnce)' might have satisfied the entire
+        // Propagating at-most-once might have satisfied the entire
         // conversion. If so, we're done, otherwise keep converting.
         if (fromFunc->isEqual(toType))
           return expr;
@@ -8031,8 +8046,6 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
   case TypeKind::ProtocolComposition:
   case TypeKind::ParameterizedProtocol:
   case TypeKind::Existential:
-  case TypeKind::BoundGenericEnum:
-  case TypeKind::BoundGenericStruct:
   case TypeKind::GenericFunction:
   case TypeKind::GenericTypeParam:
   case TypeKind::DependentMember:
@@ -8056,8 +8069,8 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
     return coerceExistential(expr, toType, locator);
 
   // Coercion to Optional<T>.
-  case TypeKind::BoundGenericEnum: {
-    auto toGenericType = cast<BoundGenericEnumType>(desugaredToType);
+  case TypeKind::Enum: {
+    auto toGenericType = cast<EnumType>(desugaredToType);
     if (!toGenericType->getDecl()->isOptionalDecl())
       break;
     TypeChecker::requireOptionalIntrinsics(ctx, expr->getLoc());
@@ -8074,8 +8087,8 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
     return result;
   }
 
-  case TypeKind::BoundGenericStruct: {
-    auto toStruct = cast<BoundGenericStructType>(desugaredToType);
+  case TypeKind::Struct: {
+    auto toStruct = cast<StructType>(desugaredToType);
     if (!toStruct->isArray() && !toStruct->isDictionary())
       break;
 
@@ -8095,10 +8108,7 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
   case TypeKind::Error:
   case TypeKind::Module:
   case TypeKind::Tuple:
-  case TypeKind::Enum:
-  case TypeKind::Struct:
   case TypeKind::Class:
-  case TypeKind::BoundGenericClass:
   case TypeKind::Metatype:
   case TypeKind::DynamicSelf:
   case TypeKind::PrimaryArchetype:
@@ -8510,7 +8520,36 @@ Expr *ExprRewriter::finishApply(ApplyExpr *apply, Type openedType,
         cs.setType(replacement, resultType);
         return replacement;
       }
-      
+
+      case DeclTypeCheckingSemantics::WithoutActuallyDiscarding: {
+        // Resolve into body(convert(closure)), where the conversion is marked
+        // as a deliberate drop of the exactly-once guarantee.
+        auto *args = apply->getArgs();
+        assert(args->size() == 2 && "should have two arguments");
+        auto *exactlyOnce = cs.coerceToRValue(args->getExpr(0));
+        auto *body = cs.coerceToRValue(args->getExpr(1));
+        auto bodyFnTy = cs.getType(body)->castTo<FunctionType>();
+        auto resultType = bodyFnTy->getResult();
+        auto atMostOnceTy = bodyFnTy->getParams()[0].getPlainType();
+
+        // The body is immediately called, so is obviously noescape.
+        bodyFnTy = cast<FunctionType>(
+            bodyFnTy->withExtInfo(bodyFnTy->getExtInfo().withNoEscape()));
+        body = coerceToType(body, bodyFnTy, locator);
+        assert(body && "can't make nonescaping?!");
+
+        auto *conversion =
+            new (ctx) FunctionConversionExpr(exactlyOnce, atMostOnceTy);
+        conversion->setWithoutActuallyDiscarding();
+        cs.setType(conversion, atMostOnceTy);
+
+        auto *argList = ArgumentList::forImplicitUnlabeled(ctx, {conversion});
+        auto *replacement = CallExpr::createImplicit(ctx, body, argList);
+        cs.cacheSubExprTypes(replacement);
+        cs.setType(replacement, resultType);
+        return replacement;
+      }
+
       case DeclTypeCheckingSemantics::OpenExistential: {
         // Resolve into an OpenExistentialExpr.
         auto *args = apply->getArgs();

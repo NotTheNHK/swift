@@ -116,8 +116,8 @@ llvm::Value *irgen::emitCheckedCast(IRGenFunction &IGF,
     // endpoint, which requires a temporary buffer to put the result into.
     //
     // The copy that entails is safe because Sema rejects casting out of a
-    // non-'Copyable' existential at these deployment targets.  See
-    // checkNoncopyableExistentialCastingAvailability().
+    // non-'Copyable' value at these deployment targets.  See
+    // checkNoncopyableCastingAvailability().
     auto targetSILType =
         IGF.IGM.getLoweredType(AbstractionPattern::getOpaque(), targetType);
     auto &targetTI = IGF.getTypeInfo(targetSILType);
@@ -138,9 +138,12 @@ llvm::Value *irgen::emitCheckedCast(IRGenFunction &IGF,
       IGF.Builder.CreateCondBr(call, destroyBB, contBB);
 
       IGF.Builder.emitBlock(destroyBB);
-      targetTI.destroy(IGF, scratch.getAddress(), targetSILType,
-                       /*isOutlined=*/false);
-      IGF.Builder.CreateBr(contBB);
+      {
+        ConditionalDominanceScope condition(IGF);
+        targetTI.destroy(IGF, scratch.getAddress(), targetSILType,
+                         /*isOutlined=*/false);
+        IGF.Builder.CreateBr(contBB);
+      }
 
       IGF.Builder.emitBlock(contBB);
     }

@@ -476,7 +476,7 @@ swift::getNonEscapingClosureConversion(PartialApplyInst *pai) {
     return nullptr;
 
   // Only a [not_guaranteed] conversion is promoted unless the closure is
-  // @called(atMostOnce). See fixupClosureLifetimes.
+  // at-most-once. See fixupClosureLifetimes.
   if (cvt->isLifetimeGuaranteed() &&
       !cvt->getType().hasCalledAtMostOnceSemantics())
     return nullptr;
@@ -488,6 +488,27 @@ swift::getNonEscapingClosureConversion(PartialApplyInst *pai) {
     return nullptr;
 
   return cvt;
+}
+
+/// Returns true if \p value stays live across each of a closure's
+/// \p lifetimeEnds.
+static bool isLiveAcrossClosureLifetime(
+    SILValue value, ArrayRef<SILInstruction *> lifetimeEnds) {
+  // A guaranteed function argument is live throughout the function.
+  if (auto *arg = dyn_cast<SILFunctionArgument>(value))
+    if (arg->getOwnershipKind() == OwnershipKind::Guaranteed)
+      return true;
+  if (lifetimeEnds.empty())
+    return false;
+  SSAPrunedLiveness liveness(value->getFunction());
+  liveness.initializeDef(value);
+  auto summary = liveness.computeSimple();
+  if (summary.innerBorrowKind != InnerBorrowKind::Contained ||
+      summary.addressUseKind != AddressUseKind::NonEscaping)
+    return false;
+  return llvm::all_of(lifetimeEnds, [&](SILInstruction *end) {
+    return liveness.isWithinBoundary(end);
+  });
 }
 
 /// Insert a mark_dependence for any non-trivial argument of a partial_apply.
@@ -503,7 +524,7 @@ static SILValue insertMarkDependenceForCapturedArguments(PartialApplyInst *pai,
       if (m->hasGuaranteedInitialKind())
         continue;
 
-    // A `@called(atMostOnce)` closure's on-stack context takes ownership of its
+    // An at-most-once closure's on-stack context takes ownership of its
     // Copyable captures directly.
     if (pai->hasCalledAtMostOnceSemantics() &&
         !arg.get()->getType().isAddress())
@@ -615,7 +636,7 @@ collectStackClosureLifetimeEnds(SmallVectorImpl<SILInstruction *> &lifetimeEnds,
       continue;
     }
 
-    // `@called(atMostOnce)` is always consumed by a call.
+    // at-most-once is always consumed by a call.
     if (v->getType().hasCalledAtMostOnceSemantics() &&
         (isa<ApplyInst>(consumer) || isa<TryApplyInst>(consumer))) {
       lifetimeEnds.push_back(consumer);
@@ -717,9 +738,9 @@ static SILValue tryRewriteToPartialApplyStack(
         }
       }
 
-      // A `@called(atMostOnce)` closure's on-stack context takes ownership of
+      // An at-most-once closure's on-stack context takes ownership of
       // its Copyable captured arguments unlike regular closures that always
-      // borrow. This is done because a `@called(atMostOnce)` closure has a
+      // borrow. This is done because an at-most-once closure has a
       // destructor. A move-only consuming capture has to be transferred
       // into the closure, not borrowed as well.
       bool isConsumedInCaller = ApplySite(origPA)
@@ -763,9 +784,9 @@ static SILValue tryRewriteToPartialApplyStack(
     auto origTy = convert->getType().castTo<SILFunctionType>();
     auto origWithNoEscape = SILType::getPrimitiveObjectType(
         origTy->getWithExtInfo(origTy->getExtInfo().withNoEscape()));
-    closureOp = b.createConvertFunction(convert->getLoc(), closure,
-                                        origWithNoEscape, false);
-    
+    closureOp =
+        b.createConvertFunction(convert->getLoc(), closure, origWithNoEscape);
+
     /* DEBUG
     llvm::errs() << "--- with\n";
     closureOp->dumpInContext();
@@ -836,6 +857,26 @@ static SILValue tryRewriteToPartialApplyStack(
     LLVM_DEBUG(llvm::dbgs() << "considering whether to eliminate copy of capture\n";
                copy->printInContext(llvm::dbgs());
                llvm::dbgs() << "\n");
+
+    // With opaque values, SILGen's copy of an address-only capture is the
+    // copy_value borrowed above, not an alloc_stack. Borrow the original
+    // instead if it stays live for the closure's whole lifetime.
+    if (auto *borrow = dyn_cast<BeginBorrowInst>(copy)) {
+      auto *copyInst = dyn_cast<CopyValueInst>(borrow->getOperand());
+      if (copyInst && copyInst->hasOneUse() &&
+          site.getArgumentConvention(arg) ==
+              SILArgumentConvention::Indirect_In_Guaranteed &&
+          !newPA->hasCalledAtMostOnceSemantics() &&
+          (!DisableCopyEliminationOfCopyableCapture ||
+           copy->getType().isMoveOnly()) &&
+          isLiveAcrossClosureLifetime(copyInst->getOperand(), lifetimeEnds)) {
+        LLVM_DEBUG(llvm::dbgs() << "++ borrowing the original instead\n");
+        borrow->setOperand(copyInst->getOperand());
+        borrowedOriginals.insert(copyInst->getOperand());
+        saveDeleteInst(copyInst);
+      }
+      continue;
+    }
 
     auto stack = dyn_cast<AllocStackInst>(copy);
     if (!stack) {
@@ -1012,6 +1053,15 @@ static SILValue tryRewriteToPartialApplyStack(
   closureOp->dump();
   llvm::errs() << "--- at\n";
   */
+  // The on-stack context of an at-most-once closure takes ownership of the
+  // noncopyable address-only arguments that the closure consumes, so there
+  // is nothing for the caller to destroy after the closure's lifetime ends.
+  llvm::SmallPtrSet<SILValue, 4> addressArgsOwnedByClosure;
+  for (auto &arg : newPA->getArgumentOperands()) {
+    if (ApplySite(newPA).hasContextOwnedAddressArgument(arg))
+      addressArgsOwnedByClosure.insert(arg.get());
+  }
+
   for (auto destroy : lifetimeEnds) {
     /* DEBUG
     destroy->dump();
@@ -1037,12 +1087,16 @@ static SILValue tryRewriteToPartialApplyStack(
           builder.createEndBorrow(newPA->getLoc(), argBorrow);
         }
 
-        // Unlike regular on-stack closures `@called(atMostOnce)` don't borrow
+        // Unlike regular on-stack closures at-most-once don't borrow
         // their non-trivially destroyable Copyable captures because they always
         // have a destructor and so no separate cleanup for such values in
         // necessary.
         if (newPA->hasCalledAtMostOnceSemantics() && !argBorrow &&
             !argValue->getType().isAddress())
+          return SILValue();
+
+        // The closure's context owns the argument.
+        if (addressArgsOwnedByClosure.contains(argValue))
           return SILValue();
 
         // Don't need to destroy if we borrowed in place .
@@ -1052,7 +1106,7 @@ static SILValue tryRewriteToPartialApplyStack(
                                        newPA->getLoc());
     };
 
-    // `try_apply` is a terminator: a `@called(atMostOnce)` closure consumed as
+    // `try_apply` is a terminator: an at-most-once closure consumed as
     // the callee of a throwing call ends its lifetime at the call itself, but
     // there is no "next instruction in the same block" to insert after. The
     // consuming callee operand is spent before either successor runs, so the
@@ -1585,7 +1639,7 @@ static bool fixupClosureLifetimes(SILFunction &fn,
       if (!cvt)
         continue;
 
-      // @called(atMostOnce) has owned convention so it's always lifetime
+      // at-most-once has owned convention so it's always lifetime
       // guaranteed due to owned convention, but that only means no extra
       // `destroy_value`. Stack promotion should still be attempted were call
       // that takes it is a lifetime ending use.
@@ -1611,7 +1665,7 @@ static bool fixupClosureLifetimes(SILFunction &fn,
         continue;
       }
 
-      // A `@called(atMostOnce)` conversion's ownership is already fully
+      // An at-most-once conversion's ownership is already fully
       // accounted for even when on-stack promotion above didn't apply.
       if (hasCalledAtMostOnceSemantics) {
         assert(cvt->isLifetimeGuaranteed());

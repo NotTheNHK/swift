@@ -87,6 +87,7 @@ private func registerSwiftPasses() {
   registerPass(copySinking, { copySinking.run($0) })
   registerPass(condFailOptimization, { condFailOptimization.run($0) })
   registerPass(diagnoseInfiniteRecursion, { diagnoseInfiniteRecursion.run($0) })
+  registerPass(implicitDestroyChecker, { implicitDestroyChecker.run($0) })
   registerPass(destroyHoisting, { destroyHoisting.run($0) })
   registerPass(mandatoryDestroyHoisting, { mandatoryDestroyHoisting.run($0) })
   registerPass(initializeStaticGlobalsPass, { initializeStaticGlobalsPass.run($0) })
@@ -128,6 +129,7 @@ private func registerSwiftPasses() {
   registerPass(loopInvariantCodeMotionPass, { loopInvariantCodeMotionPass.run($0) })
   registerPass(killInvalidDebugValuesPass, { killInvalidDebugValuesPass.run($0) })
   registerPass(deadDebugVariableEliminationPass, { deadDebugVariableEliminationPass.run($0) })
+  registerPass(packTypeElimination, { packTypeElimination.run($0) })
   registerPass(packSpecialization, { packSpecialization.run($0) })
   registerPass(trivialOwnershipElimination, { trivialOwnershipElimination.run($0) })
 
