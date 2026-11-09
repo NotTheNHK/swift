@@ -1163,8 +1163,7 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   bool HadError = false;
 
   if (auto A = Args.getLastArg(OPT_language_mode)) {
-    auto vers =
-        VersionParser::parseVersionString(A->getValue(), SourceLoc(), &Diags);
+    auto vers = VersionParser::parseLanguageMode(A->getValue(), &Diags);
     bool isValid = false;
     if (vers.has_value()) {
       if (auto effectiveVers = vers.value().getEffectiveLanguageVersion()) {
@@ -2263,6 +2262,11 @@ static bool ParseTypeCheckerArgs(TypeCheckerOptions &Opts, ArgList &Args,
       Args.hasFlag(OPT_solver_enable_short_conversions,
                    OPT_solver_disable_short_conversions,
                    Opts.SolverEnableShortConversions);
+
+  Opts.SolverEnableExtremeEdgeContraction =
+      Args.hasFlag(OPT_solver_enable_extreme_edge_contraction,
+                   OPT_solver_disable_extreme_edge_contraction,
+                   Opts.SolverEnableExtremeEdgeContraction);
 
   if (FrontendOpts.RequestedAction == FrontendOptions::ActionType::Immediate)
     Opts.DeferToRuntime = true;
@@ -3744,6 +3748,9 @@ static bool ParseTBDGenArgs(TBDGenOptions &Opts, ArgList &Args,
   Opts.WitnessMethodElimination = Args.hasArg(OPT_enable_llvm_wme);
   Opts.FragileResilientProtocols =
     Args.hasArg(OPT_enable_fragile_resilient_protocol_witnesses);
+  Opts.RelativeProtocolWitnessTables =
+      Args.hasFlag(OPT_enable_relative_protocol_witness_tables,
+                   OPT_disable_relative_protocol_witness_tables, false);
 
   if (const Arg *A = Args.getLastArg(OPT_tbd_compatibility_version)) {
     Opts.CompatibilityVersion = A->getValue();

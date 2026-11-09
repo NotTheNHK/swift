@@ -139,10 +139,14 @@ struct BridgedOptimizerUtilities {
   typedef void (* _Nonnull UpdateFunctionFn)(BridgedContext, BridgedFunction);
   typedef void (* _Nonnull UpdateLifetimeFunctionFn)(BridgedContext, BridgedFunction, bool);
   typedef void (* _Nonnull UpdateLifetimeValuesFn)(BridgedContext, BridgedArrayRef, BridgedArrayRef);
+  typedef BridgedInstruction (* _Nonnull UpdateInstructionFn)(BridgedContext, BridgedInstruction);
 
   static void registerLifetimeCompletion(UpdateLifetimeFunctionFn completeAllLifetimesFn,
                                          UpdateLifetimeValuesFn completeLifetimeFn);
   static void registerControlFlowUtils(UpdateFunctionFn breakInfiniteLoopsFn);
+  static void registerDebugReconstructionSimplification(
+      UpdateFunctionFn simplifyDebugReconstructionBlocksFn,
+      UpdateInstructionFn simplifyDebugReconstructionBlockFn);
 };
 
 struct BridgedLoopTree {
@@ -203,6 +207,7 @@ struct BridgedPassContext {
   /// Visits the type of every non-copyable nominal type declared in this
   /// module for which IRGen may emit type metadata (and therefore value
   /// witnesses, which destroy the type).
+  /// Also every exported type specialization.
   void visitTypesWithEmittedMetadata(
       void *_Nonnull context,
       void (*_Nonnull callback)(void *_Nonnull context, BridgedType type)) const;
@@ -210,6 +215,7 @@ struct BridgedPassContext {
   /// Visits the conformance of every non-generic witness table in this module
   /// which IRGen emits eagerly in Embedded Swift, i.e. the ones of
   /// `@export(interface)` conformances.
+  /// Also the conformances of exported type specializations.
   void visitConformancesWithEagerlyEmittedWitnessTables(
       void *_Nonnull context,
       void (*_Nonnull callback)(void *_Nonnull context,
@@ -218,6 +224,7 @@ struct BridgedPassContext {
   SWIFT_IMPORT_UNSAFE DevirtResult tryDevirtualizeApply(BridgedInstruction apply, bool isMandatory) const;
   bool tryOptimizeKeypath(BridgedInstruction apply) const;
   SWIFT_IMPORT_UNSAFE OptionalBridgedValue constantFoldBuiltin(BridgedInstruction builtin) const;
+  SWIFT_IMPORT_UNSAFE OptionalBridgedValue simplifyInstruction(BridgedInstruction inst) const;
   SWIFT_IMPORT_UNSAFE OptionalBridgedFunction specializeFunction(BridgedFunction function,
                                                                  BridgedSubstitutionMap substitutions,
                                                                  bool convertIndirectToDirect,
@@ -227,6 +234,7 @@ struct BridgedPassContext {
   bool specializeWitnessMethodInst(BridgedInstruction wm) const;
   bool specializeKeyPathInst(BridgedInstruction kpi) const;
   bool specializeAppliesInFunction(BridgedFunction function, bool isMandatory) const;
+  bool unrollPackLoopsInFunction(BridgedFunction function) const;
   BridgedOwnedString mangleOutlinedVariable(BridgedFunction function) const;
   BridgedOwnedString mangleAsyncRemoved(BridgedFunction function) const;
 

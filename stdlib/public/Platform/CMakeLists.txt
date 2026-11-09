@@ -8,6 +8,7 @@ set(swift_platform_compile_flags)
 if(SWIFT_ENABLE_REFLECTION)
   list(APPEND swift_platform_compile_flags "-DSWIFT_ENABLE_REFLECTION")
 endif()
+list(APPEND swift_platform_compile_flags -Xfrontend -enable-sil-opaque-values)
 
 set(swiftGlibc_target_sdks CYGWIN FREEBSD OPENBSD LINUX HAIKU)
 if(SWIFT_FREESTANDING_FLAVOR STREQUAL "linux")
@@ -590,7 +591,7 @@ if(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB)
 
   if(SWIFT_WASI_SYSROOT_PATH)
     set(arch "wasm32")
-    set(triple "wasm32-unknown-wasip1")
+    set(triple "${SWIFT_EMBEDDED_WASI_TRIPLE}")
 
     set(SWIFT_SDK_embedded_ARCH_${arch}_MODULE "${triple}")
     set(SWIFT_SDK_embedded_ARCH_${arch}_TRIPLE "${triple}")

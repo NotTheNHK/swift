@@ -319,6 +319,13 @@ PrintOptions PrintOptions::printSwiftInterfaceFile(ModuleDecl *ModuleToPrint,
       if (D->getAttrs().hasAttribute<ImplementationOnlyAttr>())
         return false;
 
+      // Skip a '@specialized' declaration without a body: it only asks to
+      // export a specialization of another module's function, but without a
+      // body, the interface would declare a new function this module doesn't
+      // define.
+      if (SpecializedAttr::isSpecializationDeclaration(D))
+        return false;
+
       // Skip the backing storage property of a wrapped property when the
       // wrapped property itself is printed. The attached wrapper attribute is
       // printed too, so the backing storage property is synthesized again when
@@ -364,7 +371,7 @@ PrintOptions PrintOptions::printSwiftInterfaceFile(ModuleDecl *ModuleToPrint,
         }
       }
 
-      // Skip @c @implementation functions along with the attribute.
+      // Skip C-exported @implementation functions along with the attribute.
       if (auto AFD = dyn_cast<AbstractFunctionDecl>(D)) {
         if (options.excludeAttrKind(DeclAttrKind::ObjCImplementation) &&
             AFD->isObjCImplementation() && AFD->getCDeclKind())
@@ -1089,7 +1096,14 @@ class PrintAST : public ASTVisitor<PrintAST> {
     if (auto storageDecl = dyn_cast<AbstractStorageDecl>(D)) {
       if (auto setter = storageDecl->getAccessor(AccessorKind::Set)) {
         AccessLevel setterAccess = setter->getFormalAccess();
-        if (setterAccess != D->getFormalAccess() && !shouldSkipSetterAccess)
+        // Module interfaces usually convey a less accessible setter by omitting
+        // it. A setter that is still printed in the accessor list (e.g. because
+        // it is '@inlinable' or '@usableFromInline') must spell out its access
+        // level. Simply stored properties are always printed as '{ get }'.
+        bool setterIsPrinted = !storageDecl->getImplInfo().isSimpleStored() &&
+                               Options.shouldPrint(setter);
+        if (setterAccess != D->getFormalAccess() &&
+            (!shouldSkipSetterAccess || setterIsPrinted))
           printAccess(setterAccess, "(set)");
       }
     }
@@ -1272,7 +1286,7 @@ private:
   bool shouldPrint(const Decl *D, bool Notify = false);
   bool shouldPrintPattern(const Pattern *P);
   void printPatternType(const Pattern *P);
-  void printAccessors(const AbstractStorageDecl *ASD);
+  void printAccessors(const AbstractStorageDecl *ASD, bool printedInitializer);
   void printSelfAccessKindModifiersIfNeeded(const FuncDecl *FD);
   void printMembersOfDecl(Decl *NTD, bool needComma = false,
                           bool openBracket = true, bool closeBracket = true,
@@ -1457,18 +1471,6 @@ static bool hasLessAccessibleSetter(const AbstractStorageDecl *ASD) {
   return ASD->getSetterFormalAccess() < ASD->getFormalAccess();
 }
 
-bool canPrintSyntheticSILGenName(const Decl *D) {
-  ASSERT(!D->getAttrs().hasAttribute<SILGenNameAttr>());
-
-  // Only print on functions, and only those functions with no barriers to use.
-  if (auto FD = dyn_cast<AbstractFunctionDecl>(D); !FD
-        || FD->getAttrs().hasAttribute<BackDeployedAttr>()
-        || FD->getOpaqueResultTypeDecl())
-    return false;
-
-  return true;
-}
-
 /// Whether the given declaration has an attached global actor attribute.
 ///
 /// Unlike \c Decl::getGlobalActorAttr() this inspects the attribute list
@@ -1513,27 +1515,6 @@ void PrintAST::printAttributes(const Decl *D) {
     if (Options.PrintImplicitAttrs && !Options.excludeAttr(abiAttr)) {
       abiAttr->print(Printer, Options, D);
       scope.Options.ExcludeAttrList.push_back(DeclAttrKind::ABI);
-    }
-  }
-
-  if (Options.PrintSyntheticSILGenName
-        && !D->getAttrs().hasAttribute<SILGenNameAttr>()) {
-    if (canPrintSyntheticSILGenName(D)) {
-      auto mangledName =
-          Mangle::ASTMangler(D->getASTContext())
-              .mangleAnyDecl(cast<ValueDecl>(D), /*addPrefix*/ true);
-      Printer.printAttrName("@_silgen_name");
-      Printer << "(";
-      Printer.printEscapedStringLiteral(mangledName);
-      Printer << ")\n";
-    }
-    else {
-      Printer.printAttrName("@available");
-      Printer << "(*, unavailable, message: ";
-      Printer.printEscapedStringLiteral(
-          "this compiler cannot match the ABI specified by the @abi attribute");
-      Printer << ")\n";
-      scope.Options.ExcludeAttrList.push_back(DeclAttrKind::Available);
     }
   }
 
@@ -2586,6 +2567,16 @@ bool ShouldPrintChecker::shouldPrint(const Decl *D,
     return false;
   }
 
+  // Don't print a synthesized, back-deployed member at all. They will be
+  // synthesized by the client.
+  if (Options.IsForSwiftInterface && D->isImplicit() &&
+      !Options.excludeAttrKind(DeclAttrKind::BackDeployed)) {
+    if (auto *VD = dyn_cast<ValueDecl>(D))
+      if (VD->isSynthesized() && VD->getDeclContext()->isTypeContext() &&
+          VD->isBackDeployed())
+        return false;
+  }
+
   // Optionally skip these checks for extensions synthesized for '@_nonSendable'
   if (!Options.AlwaysPrintNonSendableExtensions || !isNonSendableExtension(D)) {
     if (Options.SkipImplicit && D->isImplicit()) {
@@ -2634,6 +2625,16 @@ bool ShouldPrintChecker::shouldPrint(const Decl *D,
   if (Options.SkipSwiftPrivateClangDecls) {
     if (auto ClangD = D->getClangDecl()) {
       if (ClangD->hasAttr<clang::SwiftPrivateAttr>())
+        return false;
+    }
+  }
+
+  if (Options.SkipHiddenCArrayProjections) {
+    if (auto cArrayAttr = D->getAttrs().getAttribute<CArrayProjectionAttr>()) {
+      auto clangLoader = D->getASTContext().getClangModuleLoader();
+      auto visibleProjection = clangLoader->getVisibleCArrayProjection();
+      
+      if (visibleProjection != cArrayAttr->getProjection())
         return false;
     }
   }
@@ -2788,7 +2789,8 @@ void PrintAST::printSelfAccessKindModifiersIfNeeded(const FuncDecl *FD) {
   }
 }
 
-void PrintAST::printAccessors(const AbstractStorageDecl *ASD) {
+void PrintAST::printAccessors(const AbstractStorageDecl *ASD,
+                              bool printedInitializer) {
   if (isa<VarDecl>(ASD) && !Options.PrintPropertyAccessors)
     return;
   if (isa<SubscriptDecl>(ASD) && !Options.PrintSubscriptAccessors)
@@ -2806,22 +2808,7 @@ void PrintAST::printAccessors(const AbstractStorageDecl *ASD) {
   // *and* the accessor block not starting with willSet/didSet, print an
   // attribute as a disambiguation marker.
   auto printDisambiguationMarkerIfNeeded = [&]() {
-    auto *VD = dyn_cast<VarDecl>(ASD);
-    if (!VD)
-      return;
-    auto *PBD = VD->getParentPatternBinding();
-    if (!PBD)
-      return;
-    auto i = PBD->getPatternEntryIndexForVarDecl(VD);
-
-    bool needsDisambiguationAttr = false;
-    if (Options.PrintExprs) {
-      needsDisambiguationAttr |= bool(PBD->getInit(i));
-    } else if (Options.VarInitializers) {
-      needsDisambiguationAttr |= bool(PBD->hasInitStringRepresentation(i) &&
-                                      VD->isInitExposedToClients());
-    }
-    if (needsDisambiguationAttr)
+    if (printedInitializer)
       Printer << " @_accessorBlock";
   };
 
@@ -3054,6 +3041,12 @@ void PrintAST::printAccessors(const AbstractStorageDecl *ASD) {
     }
   }
 
+  // Don't print an empty accessor block after an initializer, e.g. for a
+  // non-public observed property in a '@frozen' type whose accessors are all
+  // filtered out. Such a block carries no information.
+  if (accessorsToPrint.empty() && printedInitializer)
+    return;
+
   Printer << " {";
 
   if (accessorsToPrint.empty() ||
@@ -3156,14 +3149,15 @@ static bool sortClangDecls(Decl *lhs, Decl *rhs) {
   auto *LHS = getClangDecl(lhs), *RHS = getClangDecl(rhs);
   if (LHS && RHS) {
     // Both lhs and rhs are directly imported from Clang
-    // First, sort based on module name, if any
+    // First, sort based on module name, if any. Decls without an owning module
+    // (e.g., members of implicit template instantiations) fall through.
     auto *LMod = LHS->getOwningModule(), *RMod = RHS->getOwningModule();
-    if (!LMod || !RMod)
+    if (!LMod != !RMod)
       return (bool)LMod < (bool)RMod;
-    if (LMod != RMod)
+    if (LMod && LMod != RMod)
       return LMod->Name < RMod->Name;
 
-    // Both come from the same module; sort based on location, if any
+    // Same (or no) module; sort based on location, if any
     auto LLoc = LHS->getLocation(), RLoc = RHS->getLocation();
     if (!LLoc.isValid() || !RLoc.isValid())
       return LLoc.isValid() < RLoc.isValid();
@@ -3713,14 +3707,6 @@ suppressingFeatureCoroutineAccessors(PrintOptions &options,
 }
 
 static void
-suppressingFeatureABIAttributeSE0479(PrintOptions &options,
-                                     llvm::function_ref<void()> action) {
-  llvm::SaveAndRestore<bool> scope1(options.PrintSyntheticSILGenName, true);
-  ExcludeAttrRAII scope2(options.ExcludeAttrList, DeclAttrKind::ABI);
-  action();
-}
-
-static void
 suppressingFeaturePreInverseGenericsExcept(PrintOptions &options,
                                            llvm::function_ref<void()> action) {
   ExcludeAttrRAII scope(options.ExcludeAttrList,
@@ -3733,6 +3719,13 @@ suppressingFeatureAddressableTypes(PrintOptions &options,
                                    llvm::function_ref<void()> action) {
   ExcludeAttrRAII scope(options.ExcludeAttrList,
                         DeclAttrKind::AddressableForDependencies);
+  action();
+}
+
+static void
+suppressingFeatureBackDeployFrozenValueTypes(
+    PrintOptions &options, llvm::function_ref<void()> action) {
+  ExcludeAttrRAII scope(options.ExcludeAttrList, DeclAttrKind::BackDeployed);
   action();
 }
 
@@ -4045,8 +4038,11 @@ void PrintAST::visitPatternBindingDecl(PatternBindingDecl *decl) {
 
   bool printAsVar = false;
   if (anyVar) {
-    printAsVar = (anyVar->isSettable(anyVar->getDeclContext()) ||
-                  isInObjCImpl(anyVar));
+    if (Options.PrintPatternBindingIntroducerAsWritten)
+      printAsVar = anyVar->getIntroducer() != VarDecl::Introducer::Let;
+    else
+      printAsVar = (anyVar->isSettable(anyVar->getDeclContext()) ||
+                    isInObjCImpl(anyVar));
   }
 
   Printer << (printAsVar ? "var " : "let ");
@@ -4085,10 +4081,12 @@ void PrintAST::visitPatternBindingDecl(PatternBindingDecl *decl) {
       printPatternType(pattern);
     }
 
+    bool printedInitializer = false;
     if (Options.PrintExprs) {
       if (auto initExpr = decl->getInit(idx)) {
         Printer << " = ";
         visit(initExpr);
+        printedInitializer = true;
       }
     } else if (Options.VarInitializers) {
       auto *vd = decl->getAnchoringVarDecl(idx);
@@ -4096,6 +4094,7 @@ void PrintAST::visitPatternBindingDecl(PatternBindingDecl *decl) {
           vd->isInitExposedToClients()) {
         SmallString<128> scratch;
         Printer << " = " << decl->getInitStringRepresentation(idx, scratch);
+        printedInitializer = true;
       }
     }
 
@@ -4103,7 +4102,7 @@ void PrintAST::visitPatternBindingDecl(PatternBindingDecl *decl) {
     // print the accessors here. It is an error to add accessors to a
     // pattern binding with multiple entries.
     if (auto var = decl->getSingleVar()) {
-      printAccessors(var);
+      printAccessors(var, printedInitializer);
     }
   }
 }
@@ -4514,7 +4513,7 @@ void PrintAST::visitVarDecl(VarDecl *decl) {
     printTypeLoc(tyLoc, getNonRecursiveOptions(decl));
   }
 
-  printAccessors(decl);
+  printAccessors(decl, /*printedInitializer=*/false);
 }
 
 void PrintAST::visitParamDecl(ParamDecl *decl) {
@@ -4646,9 +4645,6 @@ void PrintAST::printParameterList(ParameterList *PL,
                                   ArrayRef<AnyFunctionType::Param> params,
                                   bool isAPINameByDefault,
                                   bool isEnumElement) {
-  PrintOptions::OverrideScope scope(Options);
-  OVERRIDE_PRINT_OPTION(scope, PrintSyntheticSILGenName, false);
-
   Printer.printStructurePre(PrintStructureKind::FunctionParameterList);
   SWIFT_DEFER {
     Printer.printStructurePost(PrintStructureKind::FunctionParameterList);
@@ -5120,7 +5116,7 @@ void PrintAST::visitSubscriptDecl(SubscriptDecl *decl) {
   }
 
   printDeclGenericRequirements(decl);
-  printAccessors(decl);
+  printAccessors(decl, /*printedInitializer=*/false);
 }
 
 void PrintAST::visitConstructorDecl(ConstructorDecl *decl) {

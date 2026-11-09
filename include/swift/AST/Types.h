@@ -40,6 +40,7 @@
 #include "swift/Basic/Debug.h"
 #include "swift/Basic/InlineBitfield.h"
 #include "swift/Basic/SmallPtrSetVector.h"
+#include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/DenseSet.h"
@@ -385,6 +386,16 @@ enum class TypeMatchFlags {
   /// module didn't record the Clang function type; two present-but-different
   /// Clang types still mismatch.
   AllowMissingClangType = 1 << 10,
+  /// Allow mismatched ownership qualifiers on value parameters.
+  AllowMismatchedParameterOwnership = 1 << 11,
+  /// Treat the function type as an `init` member's declaration type, so that
+  /// unqualified parameters of the method are treated as compatible with
+  /// `consuming` parameters rather than `borrowing` parameters.
+  MatchAsInit = 1 << 12,
+  /// Treat the function type as an `init` member's method type, so that
+  /// unqualified parameters of the method are treated as compatible with
+  /// `consuming` parameters rather than `borrowing` parameters.
+  MatchAsInitParams = 1 << 13,
 };
 using TypeMatchOptions = OptionSet<TypeMatchFlags>;
 
@@ -1072,6 +1083,10 @@ public:
   /// Determine if this type is an InlineArray<n, T> and, if so, provide the
   /// element type of the array.
   Type getInlineArrayElementType();
+
+  /// Determine if this type is an InlineArray<n, T> and, if so, provide the
+  /// count of the array as an integer.
+  std::optional<APInt> getInlineArrayCount();
 
   /// Determines the element type of a known
   /// [Autoreleasing]Unsafe[Mutable][Raw]Pointer variant, or returns null if the
@@ -2494,6 +2509,21 @@ public:
     return typealias;
   }
 
+  /// Checks whether the given type is a valid parent for a typealias. This
+  /// excludes existentials and unbound generic parents, e.g:
+  ///
+  /// ```
+  /// struct S<T> {
+  ///   typealias X = Int
+  /// }
+  /// let i: S.X
+  /// ```
+  ///
+  /// We allow resolving `S.X` since the underlying type does not depend on any
+  /// outer generic parameter. However we cannot property represent this as a
+  /// TypeAliasType, so we instead need to use the desugared type.
+  static bool isValidParent(Type ty);
+
   /// Retrieve the parent of this type as written, e.g., the part that was
   /// written before ".", if provided.
   Type getParent() const {
@@ -2586,6 +2616,12 @@ StringRef getNameForParamSpecifier(ParamSpecifier name);
 /// What does \c ParamSpecifier::Default mean for a parameter that's directly
 /// attached to \p VD ? Pass \c nullptr for the value for a closure.
 ParamSpecifier getDefaultParamSpecifier(const ValueDecl *VD);
+
+/// Returns true if an override with the given parameter ownership specifier is
+/// allowed over a base method with a given parameter ownership specifier.
+bool paramSpecifiersMatch(const ValueDecl *baseDecl,
+                          ParamSpecifier baseSpec,
+                          ParamSpecifier derivedSpec);
 
 /// Provide parameter type relevant flags, i.e. variadic, autoclosure, and
 /// escaping.
@@ -2924,6 +2960,9 @@ public:
   /// getNamedElementId - If this tuple has an element with the specified name,
   /// return the element index, otherwise return -1.
   int getNamedElementId(Identifier I) const;
+
+  /// True if all elements of this tuple have the same type.
+  bool isHomogeneous() const;
 
   // Implement isa/cast/dyncast/etc.
   static bool classof(const TypeBase *T) {
@@ -4086,6 +4125,22 @@ public:
   bool isCalledOnce() const {
     return getExecutionSemantics() == ExecutionSemantics::Once;
   }
+
+  /// Returns true if values of this function type can't be copied.
+  bool isNoncopyable() const {
+    return getSuppressedInvertibleProtocols(getExecutionSemantics())
+        .contains(InvertibleProtocolKind::Copyable);
+  }
+
+  /// Returns true if values of this function type can't be destroyed
+  /// implicitly.
+  bool isNondeinitable() const {
+    return getSuppressedInvertibleProtocols(getExecutionSemantics())
+        .contains(InvertibleProtocolKind::Deinitable);
+  }
+
+  /// Returns true if calling a value of this function type consumes the value.
+  bool isCallConsuming() const { return hasCalledAtMostOnceSemantics(); }
 
   /// Returns a new function type exactly like this one but with the ExtInfo
   /// replaced.
@@ -5626,6 +5681,13 @@ public:
   /// Returns true if values of this function type must be called exactly
   /// once, which is true only for exactly-once function types.
   bool isCalledOnce() const { return getExtInfo().isCalledOnce(); }
+  /// Returns true if values of this function type can't be copied.
+  bool isNoncopyable() const { return getExtInfo().isNoncopyable(); }
+  /// Returns true if values of this function type can't be destroyed
+  /// implicitly.
+  bool isNondeinitable() const { return getExtInfo().isNondeinitable(); }
+  /// Returns true if calling a value of this function type consumes the value.
+  bool isCallConsuming() const { return getExtInfo().isCallConsuming(); }
   bool hasNonisolatedNonsendingIsolation() const {
     return getExtInfo().hasNonisolatedNonsendingIsolation();
   }
@@ -6268,7 +6330,7 @@ public:
   bool isTrivialNoEscape() const {
     return isNoEscape() &&
            getRepresentation() == SILFunctionTypeRepresentation::Thick &&
-           !hasCalledAtMostOnceSemantics();
+           !isNoncopyable();
   }
 
   bool isDifferentiable() const { return getExtInfo().isDifferentiable(); }
@@ -6817,7 +6879,7 @@ class ProtocolType : public NominalType {
 public:
   /// Retrieve the type when we're referencing the given protocol.
   /// declaration.
-  static ProtocolType *get(ProtocolDecl *D, Type Parent, const ASTContext &C);
+  static ProtocolType *get(ProtocolDecl *D, Type Parent);
 
   ProtocolDecl *getDecl() const {
     return reinterpret_cast<ProtocolDecl *>(NominalType::getDecl());
@@ -6838,7 +6900,7 @@ public:
 
 private:
   friend class NominalTypeDecl;
-  ProtocolType(ProtocolDecl *TheDecl, Type Parent, const ASTContext &Ctx,
+  ProtocolType(ProtocolDecl *TheDecl, Type Parent, const ASTContext *Ctx,
                RecursiveTypeProperties properties);
 };
 BEGIN_CAN_TYPE_WRAPPER(ProtocolType, NominalType)
@@ -8520,6 +8582,8 @@ class IntegerType final : public TypeBase, public llvm::FoldingSetNode {
 public:
   static IntegerType *get(StringRef value, bool isNegative,
                           const ASTContext &ctx);
+
+  static IntegerType *get(const APSInt &value, const ASTContext &ctx);
 
   APInt getValue() const;
 

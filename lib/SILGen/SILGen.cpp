@@ -1563,14 +1563,15 @@ void SILGenModule::emitAbstractFuncDecl(AbstractFunctionDecl *AFD) {
   ASSERT(ABIRoleInfo(AFD).providesAPI()
             && "emitAbstractFuncDecl() on ABI-only decl?");
 
-  // If the declaration is exported as a C function, emit its native-to-foreign
-  // thunk too, if it wasn't already forced.
-  if (auto cdeclAttr = AFD->getAttrs().getAttribute<CDeclAttr>()) {
-    if (cdeclAttr->Underscored) {
-      auto thunk = SILDeclRef(AFD).asForeign();
-      if (!hasFunction(thunk))
-        emitNativeToForeignThunk(thunk);
-    }
+  // Exported to C with the thunk model (@_cdecl, or @objc on a top-level
+  // function with bridged types): emit the native-to-foreign thunk carrying
+  // the C symbol name. C-compatible @objc globals use the @c single-symbol
+  // model and need no thunk.
+  if (AFD->getCDeclKind() == ForeignLanguage::ObjectiveC &&
+      !AFD->hasOnlyCEntryPoint()) {
+    auto thunk = SILDeclRef(AFD).asForeign();
+    if (!hasFunction(thunk))
+      emitNativeToForeignThunk(thunk);
   }
 
   emitDistributedThunkForDecl(AFD);
@@ -1581,7 +1582,14 @@ void SILGenModule::emitAbstractFuncDecl(AbstractFunctionDecl *AFD) {
   // for the call into \p AFD itself.
   emitDistributedResolvableProxyAdapterThunkForDecl(AFD);
 
-  if (AFD->isBackDeployed()) {
+  // A member of a back-deployed type that has no body, such as the implicit
+  // members of a derived conformance when the module is built from its
+  // textual interface, has nothing to use as a fallback.
+  if (AFD->isBackDeployed() && !isa<DestructorDecl>(AFD) &&
+      (AFD->hasBody() || AFD->getAttrs().hasAttribute<BackDeployedAttr>() ||
+       (isa<AccessorDecl>(AFD) &&
+        cast<AccessorDecl>(AFD)->getStorage()
+            ->getAttrs().hasAttribute<BackDeployedAttr>()))) {
     // Emit the fallback function that will be used when the original function
     // is unavailable at runtime.
     auto fallback = SILDeclRef(AFD).asBackDeploymentKind(
@@ -1637,6 +1645,12 @@ void SILGenModule::emitAbstractFuncDecl(AbstractFunctionDecl *AFD) {
 void SILGenModule::emitFunction(FuncDecl *fd) {
   assert(!shouldSkipDecl(fd));
 
+  // A body-less '@specialized': prepare the specialized bodies it asks for.
+  if (SpecializedAttr::isSpecializationDeclaration(fd)) {
+    prepareSpecializationDeclaration(fd);
+    return;
+  }
+
   SILDeclRef::Loc decl = fd;
 
   emitAbstractFuncDecl(fd);
@@ -1647,12 +1661,76 @@ void SILGenModule::emitFunction(FuncDecl *fd) {
   }
 }
 
+void SILGenModule::prepareSpecializationDeclaration(AbstractFunctionDecl *fd) {
+  for (auto *attr : fd->getAttrs().getAttributes<SpecializedAttr>()) {
+    // 1. The imported function it names, skipping non-exported attributes.
+    auto *target = dyn_cast_or_null<AbstractFunctionDecl>(
+        attr->getTargetFunctionDecl(fd));
+    if (!attr->isExported() || !target)
+      continue;
+    auto sig = attr->getSpecializedSignature(fd);
+    // 2. Its entry points.
+    SmallVector<SILDeclRef, 2> constants;
+    if (isa<ConstructorDecl>(target)) {
+      // Every initializer.
+      constants.push_back(SILDeclRef(target, SILDeclRef::Kind::Allocator));
+      // + designated class init.
+      if (target->getDeclContext()->getSelfClassDecl() &&
+          cast<ConstructorDecl>(target)->isDesignatedInit())
+        constants.push_back(SILDeclRef(target, SILDeclRef::Kind::Initializer));
+    } else {
+      // Functions.
+      constants.push_back(SILDeclRef(target));
+    }
+    // 3. Prepare each, or report once why its body can't be created.
+    for (auto constant : constants)
+      if (!prepareExportedSpecialization(constant, sig)) {
+        diagnose(fd->getLoc(), diag::specialized_declaration_body_unavailable,
+                 target->getName(),
+                 getFunction(constant, NotForDefinition)->isDefinition());
+        break;
+      }
+  }
+}
+
+bool SILGenModule::prepareExportedSpecialization(
+    SILDeclRef constant, GenericSignature specializedSig) {
+  // 1. Load the imported function's serialized body.
+  auto *f = getFunction(constant, NotForDefinition);
+  if (f->isExternalDeclaration())
+    M.loadFunction(f, SILModule::LinkingMode::LinkAll);
+  // 2. Give up if there's none, or it may not be specialized.
+  if (!f->hasBodyForImportedSpecialization())
+    return false;
+  // 3. Make sure the function carries the request as a SIL attribute.
+  if (llvm::none_of(f->getSpecializeAttrs(), [&](SILSpecializeAttr *attr) {
+        return attr->isExported() &&
+               attr->getSpecializedSignature().getCanonicalSignature() ==
+                   specializedSig.getCanonicalSignature();
+      }))
+    f->addSpecializeAttr(SILSpecializeAttr::create(
+        M, specializedSig, /*typeErasedParams=*/{}, /*exported=*/true,
+        SILSpecializeAttr::SpecializationKind::Full, /*target=*/nullptr,
+        Identifier(), M.getSwiftModule(), AvailabilityRange::alwaysAvailable(),
+        /*isSpecializedSpelling=*/true));
+  // 4. Record that this module creates it (weak, see LinkEntity).
+  M.addExportedSpecializationOfImportedFunction(constant, specializedSig,
+                                                /*createdHere=*/true);
+  return true;
+}
+
 void SILGenModule::addGlobalVariable(VarDecl *global) {
   // We create SILGlobalVariable here.
   getSILGlobalVariable(global, ForDefinition);
 }
 
 void SILGenModule::emitConstructor(ConstructorDecl *decl) {
+  // A body-less '@specialized': prepare the specialized bodies it asks for.
+  if (SpecializedAttr::isSpecializationDeclaration(decl)) {
+    prepareSpecializationDeclaration(decl);
+    return;
+  }
+
   // FIXME: Handle 'self' like any other argument here.
   // Emit any default argument getter functions.
   emitAbstractFuncDecl(decl);
@@ -1874,30 +1952,21 @@ void SILGenModule::emitMoveOnlyDestructor(NominalTypeDecl *cd,
     SILDeclRef deallocator(dd, SILDeclRef::Kind::Deallocator);
     emitFunctionDefinition(deallocator,
                            getFunction(deallocator, ForDefinition));
+
+    // Clients of a back-deployed type emit their own copy of its deinit when
+    // needed.
+    if (dd->isBackDeployed()) {
+      auto fallback = deallocator.asBackDeploymentKind(
+          SILDeclRef::BackDeploymentKind::Fallback);
+      emitFunctionDefinition(fallback, getFunction(fallback, ForDefinition));
+    }
   }
 }
 
 void SILGenModule::emitDefaultArgGenerator(SILDeclRef constant,
                                            ParamDecl *param) {
-  switch (param->getDefaultArgumentKind()) {
-  case DefaultArgumentKind::None:
-    llvm_unreachable("No default argument here?");
-
-  case DefaultArgumentKind::Normal:
-  case DefaultArgumentKind::StoredProperty:
+  if (param->hasDefaultArgumentGenerator())
     emitOrDelayFunction(constant);
-    break;
-
-  case DefaultArgumentKind::Inherited:
-#define MAGIC_IDENTIFIER(NAME, STRING)                                         \
-  case DefaultArgumentKind::NAME:
-#include "swift/AST/MagicIdentifierKinds.def"
-  case DefaultArgumentKind::NilLiteral:
-  case DefaultArgumentKind::EmptyArray:
-  case DefaultArgumentKind::EmptyDictionary:
-  case DefaultArgumentKind::ExpressionMacro:
-    break;
-  }
 }
 
 void SILGenModule::
@@ -2028,6 +2097,11 @@ void SILGenModule::emitObjCPropertyMethodThunks(AbstractStorageDecl *prop) {
 
   // FIXME: Add proper location.
   auto *setter = prop->getOpaqueAccessor(AccessorKind::Set);
+
+  // Don't emit a thunk for a setter that won't be emitted itself.
+  if (shouldSkipDecl(setter))
+    return;
+
   auto setterRef = SILDeclRef(setter, SILDeclRef::Kind::Func).asForeign();
   emitNativeToForeignThunk(setterRef);
 }
@@ -2096,6 +2170,24 @@ void SILGenModule::visitEmittedAccessors(
 
     callback(accessor);
   });
+}
+
+VarDecl *
+SILGenModule::findStoredCArrayCounterpart(AbstractStorageDecl *storage) {
+  auto *var = dyn_cast<VarDecl>(storage);
+  auto *attr = storage->getAttrs().getAttribute<CArrayProjectionAttr>();
+  if (!var || !attr || var->hasStorage())
+    return nullptr;
+
+  auto *counterpart = dyn_cast_or_null<VarDecl>(attr->getCounterpart());
+  if (!counterpart || !counterpart->hasStorage())
+    return nullptr;
+
+  ASSERT(counterpart->isStatic() == var->isStatic() &&
+           counterpart->getDeclContext() == var->getDeclContext() &&
+           "counterparts not accessible via same base");
+
+  return counterpart;
 }
 
 bool

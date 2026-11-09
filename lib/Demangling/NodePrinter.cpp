@@ -103,6 +103,17 @@ static DemanglerPrinter &operator<<(DemanglerPrinter &printer,
   return printer;
 }
 
+/// Print the payload of a symbolic reference node, which is either an index
+/// into the mangled name or, when produced by a remote reader, an address in
+/// the inspected process.
+static void printSymbolicReferencePayload(DemanglerPrinter &Printer,
+                                          NodePointer Node) {
+  if (Node->hasRemoteAddress())
+    Printer.writeHex(Node->getRemoteAddress().first);
+  else if (Node->hasIndex())
+    Printer.writeHex(Node->getIndex());
+}
+
 static StringRef toString(Directness d) {
   switch (d) {
   case Directness::Direct:
@@ -619,6 +630,7 @@ bool NodePrinter::isSimpleType(NodePointer Node) {
     case Node::Kind::AccessibleFunctionRecord:
     case Node::Kind::BackDeploymentThunk:
     case Node::Kind::BackDeploymentFallback:
+    case Node::Kind::BackDeploymentCopy:
     case Node::Kind::ExtendedExistentialTypeShape:
     case Node::Kind::Uniquable:
     case Node::Kind::UniqueExtendedExistentialTypeShapeSymbolicReference:
@@ -2491,6 +2503,9 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
   case Node::Kind::BackDeploymentFallback:
     Printer << "back deployment fallback for ";
     return nullptr;
+  case Node::Kind::BackDeploymentCopy:
+    Printer << "back deployment copy of ";
+    return nullptr;
   case Node::Kind::ProtocolSymbolicReference:
     Printer << "protocol symbolic reference 0x";
     Printer.writeHex(Node->getIndex());
@@ -3531,15 +3546,15 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
   }
   case Node::Kind::UniqueExtendedExistentialTypeShapeSymbolicReference:
     Printer << "unique existential shape symbolic reference 0x";
-    Printer.writeHex(Node->getIndex());
+    printSymbolicReferencePayload(Printer, Node);
     return nullptr;
   case Node::Kind::NonUniqueExtendedExistentialTypeShapeSymbolicReference:
     Printer << "non-unique existential shape symbolic reference 0x";
-    Printer.writeHex(Node->getIndex());
+    printSymbolicReferencePayload(Printer, Node);
     return nullptr;
   case Node::Kind::ObjectiveCProtocolSymbolicReference:
     Printer << "objective-c protocol symbolic reference 0x";
-    Printer.writeHex(Node->getIndex());
+    printSymbolicReferencePayload(Printer, Node);
     return nullptr;
   case Node::Kind::SymbolicExtendedExistentialType: {
     auto shape = Node->getChild(0);
@@ -3549,7 +3564,7 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
     Printer << "symbolic existential type ("
             << (isUnique ? "" : "non-")
             << "unique) 0x";
-    Printer.writeHex(shape->getIndex());
+    printSymbolicReferencePayload(Printer, shape);
     Printer << " <";
     print(Node->getChild(1), depth + 1);
     if (Node->getNumChildren() > 2) {

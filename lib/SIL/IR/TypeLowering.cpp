@@ -2478,7 +2478,14 @@ namespace {
     void emitCopyInto(SILBuilder &B, SILLocation loc, SILValue src,
                       SILValue dest, IsTake_t isTake,
                       IsInitialization_t isInit) const override {
-      llvm_unreachable("copy into");
+      ASSERT(isTake && "Cannot copy a move-only value");
+      // A take is a move, which a non-Copyable value allows.
+      if (B.getFunction().hasLoweredAddresses()) {
+        B.createCopyAddr(loc, src, dest, IsTake, isInit);
+      } else {
+        SILValue value = emitLoadOfCopy(B, loc, src, IsTake);
+        emitStoreOfCopy(B, loc, value, dest, isInit);
+      }
     }
 
     // --- Same as LeafLoadableTypeLowering.
@@ -5573,11 +5580,11 @@ TypeConverter::checkFunctionForABIDifferences(SILModule &M,
   if (fnTy2->hasErasedIsolation() && !fnTy1->hasErasedIsolation())
     return ABIDifference::NeedsThunk;
 
-  // An exactly-once value needs a context of its own, so forming one from any
-  // other thick function value needs a thunk, even from an at-most-once value
+  // A nondeinitable value needs a context of its own, so forming one from any
+  // other thick function value needs a thunk, even from a noncopyable value
   // with the same ABI. A thin function has no context, so thin-to-thick can
   // form the value directly.
-  if (fnTy2->isCalledOnce() && !fnTy1->isCalledOnce() &&
+  if (fnTy2->isNondeinitable() && !fnTy1->isNondeinitable() &&
       fnTy1->getExtInfo().hasContext())
     return ABIDifference::NeedsThunk;
 

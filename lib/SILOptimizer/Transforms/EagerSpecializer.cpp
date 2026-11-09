@@ -34,6 +34,7 @@
 
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/Type.h"
+#include "swift/SIL/GenericSpecializationMangler.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SILOptimizer/Analysis/BasicCalleeAnalysis.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
@@ -832,6 +833,18 @@ static SILFunction *eagerSpecialize(SILOptFunctionBuilder &FuncBuilder,
   return NewFunc;
 }
 
+/// Whether this module creates the exported body that \p SA asks for, for
+/// \p F of another module (see SILGenModule::prepareExportedSpecialization).
+static bool createsImportedSpecialization(SILFunction &F,
+                                          const SILSpecializeAttr *SA) {
+  return SA->isExported() &&
+         F.getModule().createsExportedSpecializationOfImportedFunction(
+             Mangle::GenericSpecializationMangler::manglePrespecialization(
+                 F.getASTContext(), F.getName().str(),
+                 F.getLoweredFunctionType()->getInvocationGenericSignature(),
+                 SA->getSpecializedSignature()));
+}
+
 /// Run the pass.
 void EagerSpecializerTransform::run() {
   if (!EagerSpecializeFlag)
@@ -853,8 +866,10 @@ void EagerSpecializerTransform::run() {
     return;
   }
 
-  // Only specialize functions in their home module.
-  if (F.isExternalDeclaration() || F.isAvailableExternally())
+  // Only specialize functions in their home module, except another module's
+  // function whose exported specialized bodies this module creates: don't skip
+  // available-externally functions up front, and filter their attributes below.
+  if (F.isExternalDeclaration())
     return;
 
   if (F.isDynamicallyReplaceable())
@@ -876,8 +891,13 @@ void EagerSpecializerTransform::run() {
   bool onlyCreatePrespecializations = this->onlyCreatePrespecializations;
 
   for (auto *SA : F.getSpecializeAttrs()) {
-    if (onlyExportedSpecialized &&
-        !(SA->isExported() && SA->isSpecializedSpelling())) {
+    // Keep the attribute if it asks for:
+    // - in the Embedded variant of this pass, an exported '@specialized' body,
+    // - for another module's function, an exported body that this module
+    //   creates (see SILGenModule::prepareExportedSpecialization).
+    if ((onlyExportedSpecialized &&
+         !(SA->isExported() && SA->isSpecializedSpelling())) ||
+        (F.isAvailableExternally() && !createsImportedSpecialization(F, SA))) {
       SpecializedFuncs.push_back(nullptr);
       ReInfoVec.emplace_back(ReabstractionInfo(F.getModule()));
       continue;
@@ -898,11 +918,13 @@ void EagerSpecializerTransform::run() {
         assert(success);
       }
       onlyCreatePrespecializations = true;
-    } else if (targetFunc->getLinkage() == SILLinkage::Shared) {
+    } else if (targetFunc->getLinkage() == SILLinkage::Shared &&
+               !F.isAvailableExternally()) {
       // We have `shared` linkage if we deserialize a public serialized
       // function.
       // That means we are loading it from another module. In this case, we
-      // don't want to create a pre-specialization.
+      // don't want to create a pre-specialization, unless this module creates
+      // it.
       SpecializedFuncs.push_back(nullptr);
       ReInfoVec.emplace_back(ReabstractionInfo(F.getModule()));
       continue;
@@ -910,13 +932,25 @@ void EagerSpecializerTransform::run() {
     ReInfoVec.emplace_back(FuncBuilder.getModule().getSwiftModule(),
                            FuncBuilder.getModule().isWholeModule(), targetFunc,
                            SA->getSpecializedSignature(), SA->isExported());
+    unsigned numNewFunctions = newFunctions.size();
     auto *NewFunc = eagerSpecialize(FuncBuilder, targetFunc, *SA,
                                     ReInfoVec.back(), newFunctions);
-    SpecializedFuncs.push_back(
-        (onlyCreatePrespecializations ||
-         SA->isExported() /*currently we don't handle coroutines in emitDispatchTo*/)
-            ? nullptr
-            : NewFunc);
+    // The function the generic body gets a fast path to, if any.
+    // None if the pass isn't asked to add fast paths.
+    if (!onlyCreatePrespecializations &&
+        // A non-exported attribute, or an exported one only:
+        (!SA->isExported() ||
+         // - for '@specialized', not '@_specialize',
+         (SA->isSpecializedSpelling() &&
+          // - not a coroutine, which emitDispatchTo doesn't handle,
+          !F.getLoweredFunctionType()->isCoroutine() &&
+          // - grew => created now (to avoid adding the same fast path more
+          //   than once, e.g. if this pass runs again on F, as an exported
+          //   attribute isn't removed after specializing)
+          newFunctions.size() > numNewFunctions)))
+      SpecializedFuncs.push_back(NewFunc);
+    else
+      SpecializedFuncs.push_back(nullptr);
     if (!SA->isExported())
       attrsToRemove.push_back(SA);
   }

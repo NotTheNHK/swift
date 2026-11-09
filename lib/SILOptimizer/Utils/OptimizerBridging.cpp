@@ -13,6 +13,7 @@
 #include "swift/SILOptimizer/OptimizerBridging.h"
 #include "../../IRGen/GenClass.h"
 #include "../../IRGen/IRGenModule.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/SemanticAttrs.h"
 #include "swift/Basic/CodeGenerationModel.h"
 #include "swift/Demangling/ManglingMacros.h"
@@ -21,6 +22,7 @@
 #include "swift/SIL/SILConstants.h"
 #include "swift/SIL/Test.h"
 #include "swift/SILOptimizer/Analysis/Analysis.h"
+#include "swift/SILOptimizer/Analysis/SimplifyInstruction.h"
 #include "swift/SILOptimizer/Utils/CFGOptUtils.h"
 #include "swift/SILOptimizer/Utils/ConstExpr.h"
 #include "swift/SILOptimizer/Utils/ConstantFolding.h"
@@ -28,6 +30,7 @@
 #include "swift/SILOptimizer/Utils/Devirtualize.h"
 #include "swift/SILOptimizer/Utils/Generics.h"
 #include "swift/SILOptimizer/Utils/InstOptUtils.h"
+#include "swift/SILOptimizer/Utils/LoopUtils.h"
 #include "swift/SILOptimizer/Utils/SILInliner.h"
 #include "swift/SILOptimizer/Utils/SILOptFunctionBuilder.h"
 #include "swift/SILOptimizer/Utils/SpecializationMangler.h"
@@ -144,6 +147,10 @@ OptionalBridgedValue BridgedPassContext::constantFoldBuiltin(BridgedInstruction 
   return {::constantFoldBuiltin(bi, resultsInError)};
 }
 
+OptionalBridgedValue BridgedPassContext::simplifyInstruction(BridgedInstruction inst) const {
+  return {::simplifyInstruction(inst.unbridged())};
+}
+
 void BridgedPassContext::inlineFunction(BridgedInstruction apply, bool mandatoryInline) const {
   SILOptFunctionBuilder funcBuilder(*invocation->getTransform());
   InstructionDeleter deleter;
@@ -234,6 +241,11 @@ void BridgedPassContext::visitTypesWithEmittedMetadata(
   swift::SILModule *mod = invocation->getPassManager()->getModule();
   for (SILType type : mod->getNonCopyableTypesWithEmittedMetadata())
     callback(context, {type});
+  // IRGen also emits the metadata of exported type specializations eagerly,
+  // so add them to 'typesWithEmittedMetadata' (e.g. for the vtable loop in
+  // MandatoryPerformanceOptimizations).
+  for (CanType type : mod->getExportedTypeSpecializations())
+    callback(context, {SILType::getPrimitiveObjectType(type)});
 }
 
 void BridgedPassContext::visitConformancesWithEagerlyEmittedWitnessTables(
@@ -262,6 +274,27 @@ void BridgedPassContext::visitConformancesWithEagerlyEmittedWitnessTables(
                           /*referencedFromInitExistential=*/true);
     callback(context, {ProtocolConformanceRef(normal)});
   }
+
+  // Exported conformance specializations: for each exported type
+  // specialization, e.g. 'Box<Int>', the conformances of its type.
+  for (CanType type : mod->getExportedTypeSpecializations()) {
+    for (auto *conformance : type->getAnyNominal()->getAllConformances()) {
+      // The conformance of the specialization, e.g. 'Box<Int>: P'.
+      auto specialized =
+          lookupConformance(type, conformance->getProtocol());
+      // Only if it exists and its type's specialization's owner, i.e. this
+      // module, owns its witness table (isExportedConformanceSpecialization).
+      if (specialized.isConcrete() &&
+          SpecializedAttr::isExportedConformanceSpecialization(
+              specialized.getConcrete())) {
+        // Load the witness table it's specialized from, as above.
+        mod->linkWitnessTable(specialized.getConcrete(),
+                              SILModule::LinkingMode::LinkNormal,
+                              /*referencedFromInitExistential=*/true);
+        callback(context, {specialized});
+      }
+    }
+  }
 }
 
 OptionalBridgedFunction BridgedPassContext::specializeFunction(BridgedFunction function,
@@ -282,6 +315,16 @@ OptionalBridgedFunction BridgedPassContext::specializeFunction(BridgedFunction f
   }
 
   SILOptFunctionBuilder FunctionBuilder(*invocation->getTransform());
+
+  // In Embedded Swift, use the specialization that the module declaring
+  // `origFunc` exports, instead of creating a local copy. Callers of
+  // `context.specialize(function:for:...)` (e.g. the vtable and deinit
+  // specializers) keep its linkage, see `isExportedSpecialization`.
+  if (mod->getOptions().EmbeddedSwift) {
+    if (auto *exported = lookupExportedSpecialization(
+            FunctionBuilder, origFunc, subs, ReInfo.getSpecializedType()))
+      return {exported};
+  }
 
   GenericFuncSpecializer FuncSpecializer(FunctionBuilder, origFunc, ReInfo.getClonerParamSubstitutionMap(),
                                          ReInfo, isMandatory);
@@ -314,6 +357,12 @@ bool BridgedPassContext::specializeKeyPathInst(BridgedInstruction kpi) const {
 
 bool BridgedPassContext::specializeAppliesInFunction(BridgedFunction function, bool isMandatory) const {
   return ::specializeAppliesInFunction(*function.getFunction(), invocation->getTransform(), isMandatory);
+}
+
+bool BridgedPassContext::unrollPackLoopsInFunction(
+    BridgedFunction function) const {
+  return swift::unrollPackLoopsInFunction(function.getFunction(),
+                                          invocation->getPassManager());
 }
 
 namespace  {

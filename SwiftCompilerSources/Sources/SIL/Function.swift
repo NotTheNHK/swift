@@ -61,6 +61,9 @@ final public class Function : CustomStringConvertible, HasShortDescription, Hash
   /// and the function has no `@_optimize(none)` attribute.
   public var shouldOptimize: Bool { bridged.shouldOptimize() }
 
+  /// True if this function is optimized for code size, e.g. with `-Osize`.
+  public var isOptimizedForSize: Bool { bridged.isOptimizedForSize() }
+
   public var wasDeserializedCanonical: Bool { bridged.wasDeserializedCanonical() }
   
   public var hasOwnershipForTrivialValues: Bool {
@@ -104,6 +107,10 @@ final public class Function : CustomStringConvertible, HasShortDescription, Hash
   public var specializationLevel: Int { bridged.specializationLevel() }
 
   public var isSpecialization: Bool { bridged.isSpecialization() }
+
+  /// True for a specialization that a `@specialized(exported: true)` attribute
+  /// declares. Its declaring module owns the only definition.
+  public var isExportedSpecialization: Bool { bridged.isExportedSpecialization() }
 
   public var hasOwnership: Bool { bridged.hasOwnership() }
 
@@ -240,6 +247,13 @@ final public class Function : CustomStringConvertible, HasShortDescription, Hash
   public func hasSemanticsAttribute(_ attr: StaticString) -> Bool {
     attr.withUTF8Buffer { (buffer: UnsafeBufferPointer<UInt8>) in
       bridged.hasSemanticsAttr(BridgedStringRef(data: buffer.baseAddress!, count: buffer.count))
+    }
+  }
+
+  public func addSemanticsAttribute(_ attr: StaticString, _ context: some MutatingContext) {
+    context.notifyEffectsChanged()
+    attr.withUTF8Buffer { (buffer: UnsafeBufferPointer<UInt8>) in
+      bridged.addSemanticsAttr(BridgedStringRef(data: buffer.baseAddress!, count: buffer.count))
     }
   }
 

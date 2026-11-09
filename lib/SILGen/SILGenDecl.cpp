@@ -1325,6 +1325,11 @@ void EnumElementPatternInitialization::emitEnumMatch(
           // if the element value is loadable.
           assert((eltTL.isTrivial(&SGF.F) || mv.hasCleanup()) &&
                  "must be able to consume value");
+          // Binding the payload of a ~C enum in a consuming switch
+	  // must consume the entire enum so that all other cases'
+	  // payloads are no longer live.
+          if (mv.getType().isMoveOnly(/*orWrapped*/ false))
+            mv = SGF.B.createOpaqueConsumeBeginAccess(loc, mv);
           mv = SGF.B.createUncheckedEnumDataAddrForTake(loc, mv, eltDecl, eltTy);
           // Load a loadable data value.
           if (eltTL.isLoadable())
@@ -1633,8 +1638,7 @@ bool EnumElementPatternInitialization::tryInitializeFromStorageReference(
   FormalEvaluationScope scope(SGF);
   LValue lv = SGF.emitLValue(storageExpr, SGFAccessKind::OwnedAddressConsume);
   ManagedValue addr = SGF.emitConsumedLValue(loc, std::move(lv));
-  if (!addr.getType().isAddress())
-    return false;
+  ASSERT(addr.getType().isAddress());
 
   return emitTakeCastAndBind(SGF, loc, addr, sourceType->getCanonicalType(),
                              targetType, subInitialization.get(), getInitInfo(),

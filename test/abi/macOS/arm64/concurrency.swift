@@ -528,6 +528,8 @@ Added: _$sScE6ReasonOSQsMc
 Added: _$sScE6ReasonOs12CaseIterablesMc
 Added: _$sScE6ReasonOs23CustomStringConvertiblesMc
 Added: _$sScE6ReasonOs28CustomDebugStringConvertiblesMc
+Added: _$sScE6reasonS2cE6ReasonO_tcfC
+Added: _$sScE6reasonScE6ReasonOvg
 Added: _$sScE6reasonScE6ReasonOvpMV
 Added: _$sScEs23CustomStringConvertiblesMc
 Added: _$sSct18cancellationReasonScE0B0OSgvpMV
@@ -578,3 +580,6 @@ Added: _$ss6TaskIDV9_rawValues6UInt64Vvg
 Added: _$ss6TaskIDV9_rawValues6UInt64VvM
 Added: _$ss6TaskIDV9_rawValues6UInt64VvpMV
 Added: _$ss6TaskIDV9_rawValues6UInt64Vvs
+
+// The resume function of a synchronous operation task, for tools
+Added: __swift_concurrency_debug_synchronous_operation_adapter

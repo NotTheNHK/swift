@@ -14,6 +14,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/AST/Ownership.h"
 #define DEBUG_TYPE "ast-types"
 
 #include "clang/AST/Type.h"
@@ -1008,6 +1009,23 @@ Type TypeBase::getArrayElementType() {
 
   // Array<T>
   return arrayType->getGenericArgs()[0];
+}
+
+std::optional<APInt> TypeBase::getInlineArrayCount() {
+  if (!isInlineArray() && !is_InlineArray())
+    return std::nullopt;
+
+  auto arrayType = getAs<StructType>();
+  if (!arrayType)
+    return std::nullopt;
+
+  // InlineArray<n, T>
+  auto countType = arrayType->getGenericArgs()[0];
+
+  if (!countType->is<IntegerType>())
+    return std::nullopt;
+
+  return countType->castTo<IntegerType>()->getValue();
 }
 
 Type TypeBase::getInlineArrayElementType() {
@@ -3924,12 +3942,31 @@ static bool matches(CanType t1, CanType t2, TypeMatchOptions matchMode,
       if (fn2Params.size() != fn1Params.size()) {
         return false;
       }
-
+      
       // Inputs are contravariant.
       for (auto i : indices(fn2.getParams())) {
+        if (fn1Params[i].isVariadic() != fn2Params[i].isVariadic())
+          return false;
+
         if (!matches(fn2Params[i].getOldType(), fn1Params[i].getOldType(),
                      matchMode, ParameterPosition::ParameterTupleElement,
                      OptionalUnwrapping::None)) {
+          return false;
+        }
+        
+        auto getOwnership = [&](AnyFunctionType::Param p) -> ValueOwnership {
+          auto ownership = p.getValueOwnership();
+          if (ownership == ValueOwnership::Default) {
+            ownership = matchMode.contains(TypeMatchFlags::MatchAsInitParams)
+              ? ValueOwnership::Owned
+              : ValueOwnership::Shared;
+          }
+          return ownership;
+        };
+        
+        if (!matchMode.contains(
+              TypeMatchFlags::AllowMismatchedParameterOwnership)
+            && getOwnership(fn1Params[i]) != getOwnership(fn2Params[i])) {
           return false;
         }
 
@@ -3940,7 +3977,12 @@ static bool matches(CanType t1, CanType t2, TypeMatchOptions matchMode,
       }
 
       // Results are covariant.
-      return (matches(fn1.getResult(), fn2.getResult(), matchMode,
+      auto resultMatchMode = matchMode;
+      if (matchMode.contains(TypeMatchFlags::MatchAsInit)) {
+        resultMatchMode -= TypeMatchFlags::MatchAsInit;
+        resultMatchMode |= TypeMatchFlags::MatchAsInitParams;
+      }
+      return (matches(fn1.getResult(), fn2.getResult(), resultMatchMode,
                       ParameterPosition::NotParameter,
                       OptionalUnwrapping::None));
     };
@@ -4037,6 +4079,17 @@ int TupleType::getNamedElementId(Identifier I) const {
 
   // Otherwise, name not found.
   return -1;
+}
+
+bool TupleType::isHomogeneous() const {
+  if (getNumElements() == 0)
+    return true;
+
+  CanType firstTy = getElementType(0)->getCanonicalType();
+  return llvm::all_of(getElementTypes(), [&](Type elemTy) {
+    return elemTy->isTypeVariableOrMember() ||
+              elemTy->getCanonicalType() == firstTy;
+  });
 }
 
 ArchetypeType::ArchetypeType(TypeKind Kind,
@@ -4968,12 +5021,12 @@ ReferenceCounting TypeBase::getReferenceCounting() {
   CanType type = getCanonicalType();
   ASTContext &ctx = type->getASTContext();
 
-  if (isForeignReferenceType())
-    return lookThroughAllOptionalTypes()
-                   ->getClassDecl()
-                   ->hasRefCountingAnnotations()
-               ? ReferenceCounting::Custom
-               : ReferenceCounting::None;
+  if (auto classDecl =
+          lookThroughAllOptionalTypes()->getClassDecl()) {
+    if (auto frtBase = classDecl->getForeignReferenceSuperclassOrSelf())
+      return frtBase->hasRefCountingAnnotations() ? ReferenceCounting::Custom
+                                                  : ReferenceCounting::None;
+  }
 
   ReferenceCounting defaultRefCounting = ReferenceCounting::Unknown;
 
@@ -5694,26 +5747,6 @@ SourceLoc swift::extractNearestSourceLoc(Type ty) {
     return extractNearestSourceLoc(nominal);
 
   return SourceLoc();
-}
-
-StringRef swift::getNameForParamSpecifier(ParamSpecifier specifier) {
-  switch (specifier) {
-  case ParamSpecifier::Default:
-    return "default";
-  case ParamSpecifier::InOut:
-    return "inout";
-  case ParamSpecifier::Borrowing:
-    return "borrowing";
-  case ParamSpecifier::Consuming:
-    return "consuming";
-  case ParamSpecifier::LegacyShared:
-    return "__shared";
-  case ParamSpecifier::LegacyOwned:
-    return "__owned";
-  case ParamSpecifier::ImplicitlyCopyableConsuming:
-    return "implicitly_copyable_consuming";
-  }
-  llvm_unreachable("bad ParamSpecifier");
 }
 
 static std::optional<DiagnosticBehavior>

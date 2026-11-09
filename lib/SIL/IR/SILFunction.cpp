@@ -23,6 +23,7 @@
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/LocalArchetypeRequirementCollector.h"
 #include "swift/AST/Module.h"
+#include "swift/AST/SemanticAttrs.h"
 #include "swift/AST/Stmt.h"
 #include "swift/Basic/CodeGenerationModel.h"
 #include "swift/Basic/OptimizationMode.h"
@@ -691,10 +692,20 @@ static bool isExportedSpecializedBodyOf(const SILFunction *parent,
       return true;
 
   // An erased function loses its SIL attributes, but keeps its declaration.
-  if (auto *decl = parent->getDeclRef().getAbstractFunctionDecl())
+  if (auto *decl = parent->getDeclRef().getAbstractFunctionDecl()) {
     for (auto *attr : decl->getAttrs().getAttributes<SpecializedAttr>())
       if (attr->isExported() && matches(attr->getSpecializedSignature(decl)))
         return true;
+    // A member also gets exported specializations from its type's attributes
+    // (see SILFunctionBuilder, which also skips default argument generators).
+    SmallVector<SpecializedAttr::TypeLevelSpecialization, 2> typeLevelSigs;
+    if (!parent->getDeclRef().isDefaultArgGenerator())
+      SpecializedAttr::getTypeLevelSpecializations(decl, typeLevelSigs);
+    if (llvm::any_of(typeLevelSigs, [&](auto &specialization) {
+          return specialization.exported && matches(specialization.signature);
+        }))
+      return true;
+  }
   return false;
 }
 
@@ -727,6 +738,11 @@ bool SILFunction::isExportedSpecialization() const {
       !getName().ends_with("Ts5"))
     return false;
 
+  // Asked for by a '@specialized' declaration without a body, in this module or
+  // an imported one.
+  if (getModule().isExportedSpecializationOfImportedFunction(getName()))
+    return true;
+
   // Library side, created in this module: the specialization info knows the
   // generic function.
   if (isSpecialization())
@@ -743,6 +759,15 @@ bool SILFunction::isExportedSpecialization() const {
     parent = getModule().getSILLoader()->lookupSILFunction(
         parentName, /*linkage=*/std::nullopt);
   return parent && isExportedSpecializedBodyOf(parent, getName());
+}
+
+bool SILFunction::hasBodyForImportedSpecialization() const {
+  // A loaded body that may be specialized: not '@_optimize(none)', 'dynamic'
+  // or marked never to be specialized.
+  return isDefinition() &&
+         getOptimizationMode() != OptimizationMode::NoOptimization &&
+         !isDynamicallyReplaceable() &&
+         !hasSemanticsAttr(semantics::OPTIMIZE_SIL_SPECIALIZE_GENERIC_NEVER);
 }
 
 bool SILFunction::hasNonUniqueDefinition() const {

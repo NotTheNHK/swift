@@ -16,6 +16,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/Attr.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/GenericEnvironment.h"
@@ -1242,6 +1243,19 @@ void IRGenerator::emitGlobalTopLevel(
   for (auto &directive: linkerDirectives) {
     createLinkerDirectiveVariable(*PrimaryIGM, directive);
   }
+
+  // In Embedded Swift, emit the metadata of exported type specializations, so
+  // that clients reference it instead of emitting their own copy.
+  if (SIL.getASTContext().LangOpts.hasFeature(Feature::Embedded)) {
+    auto &silModule = PrimaryIGM->getSILModule();
+    for (CanType type : silModule.getExportedTypeSpecializations()) {
+      // Queue the metadata as if it were used.
+      if (type->getClassDecl())
+        noteUseOfSpecializedClassMetadata(type);
+      else
+        noteUseOfSpecializedValueMetadata(type);
+    }
+  }
   for (SILGlobalVariable &v : PrimaryIGM->getSILModule().getSILGlobals()) {
     if (isLazilyEmittedGlobalVariable(v, PrimaryIGM->getSILModule()))
       continue;
@@ -1625,6 +1639,11 @@ bool IRGenerator::hasLazyMetadata(TypeDecl *type) {
 
   auto canBeLazy = [&]() -> bool {
     auto *dc = type->getDeclContext();
+    // A back-deployed type from another module is emitted wherever it is used.
+    if (auto nominal = dyn_cast<NominalTypeDecl>(type))
+      if (nominal->isBackDeployedIntoClient())
+        return true;
+
     if (isa<ClangModuleUnit>(dc->getModuleScopeContext())) {
       if (auto nominal = dyn_cast<NominalTypeDecl>(type)) {
         return requiresForeignTypeMetadata(nominal);
@@ -1670,13 +1689,28 @@ void IRGenerator::noteUseOfClassMetadata(CanType classType) {
   }
 }
 
+/// Whether another module owns \p type's metadata.
+static bool isExportedTypeSpecializationOfOtherModule(IRGenerator &IRGen,
+                                                      CanType type) {
+  auto *owner = SpecializedAttr::getExportedTypeSpecializationOwner(type);
+  return owner && owner != IRGen.SIL.getSwiftModule();
+}
+
 void IRGenerator::noteUseOfSpecializedClassMetadata(CanType classType) {
+  // Don't queue it for emission into this module if another module owns it;
+  // this module only references it.
+  if (isExportedTypeSpecializationOfOtherModule(*this, classType))
+    return;
   if (LazilyEmittedSpecializedMetadata.insert(classType.getPointer()).second) {
     LazySpecializedClassMetadata.push_back(classType);
   }
 }
 
 void IRGenerator::noteUseOfSpecializedValueMetadata(CanType valueType) {
+  // Don't queue it for emission into this module if another module owns it;
+  // this module only references it.
+  if (isExportedTypeSpecializationOfOtherModule(*this, valueType))
+    return;
   if (LazilyEmittedSpecializedMetadata.insert(valueType.getPointer()).second) {
     LazySpecializedValueMetadata.push_back(valueType);
   }
@@ -2471,6 +2505,16 @@ static IRLinkage getIRLinkage(StringRef name, const UniversalLinkageInfo &info,
   llvm_unreachable("bad SIL linkage");
 }
 
+/// Weak, so that two modules that export the same specialization of another
+/// module's function or type link without errors.
+static void makeWeakIfExportedSpecialization(IRLinkage &IRL,
+                                             const LinkEntity &entity,
+                                             ModuleDecl *swiftModule) {
+  if (IRL.Linkage == llvm::GlobalValue::ExternalLinkage &&
+      entity.isWeakExportedSpecialization(swiftModule))
+    IRL.Linkage = llvm::GlobalValue::WeakODRLinkage;
+}
+
 /// Given that we're going to define a global value but already have a
 /// forward-declaration of it, update its linkage.
 void irgen::updateLinkageForDefinition(IRGenModule &IGM,
@@ -2491,6 +2535,7 @@ void irgen::updateLinkageForDefinition(IRGenModule &IGM,
                    linkInfo, entity.getLinkage(ForDefinition), ForDefinition,
                    weakImported, isKnownLocal, entity.hasNonUniqueDefinition(),
                    entity.privateMeansPrivate());
+  makeWeakIfExportedSpecialization(IRL, entity, IGM.getSwiftModule());
   ApplyIRLinkage(IRL).to(global);
 
   LinkInfo link = LinkInfo::get(IGM, entity, ForDefinition);
@@ -2563,6 +2608,8 @@ LinkInfo LinkInfo::get(const UniversalLinkageInfo &linkInfo,
       result.Name, linkInfo, linkage, isDefinition,
       weakImported, isKnownLocal, entity.hasNonUniqueDefinition(),
       entity.privateMeansPrivate());
+  if (isDefinition)
+    makeWeakIfExportedSpecialization(result.IRL, entity, swiftModule);
   result.ForDefinition = isDefinition;
   return result;
 }
@@ -4284,7 +4331,10 @@ IRGenModule::getAddrOfLLVMVariableOrGOTEquivalent(LinkEntity entity) {
 
   if (auto *entityDC = entity.getDeclContextForEmission()) {
     auto *entitySF = entityDC->getModuleScopeContext();
-    bool clangImportedEntity = isa<ClangModuleUnit>(entitySF);
+    // Entities of back-deployed types from other modules are emitted on
+    // demand, like imported entities.
+    bool clangImportedEntity = isa<ClangModuleUnit>(entitySF) ||
+                               entity.isBackDeployedIntoClient();
 
     auto &mod = getSILModule();
 
@@ -5470,6 +5520,10 @@ llvm::GlobalValue *IRGenModule::defineTypeMetadata(
         isObjCImpl)
       return var;
 
+    // Back-deployed types don't get an alias; see getAddrOfTypeMetadata().
+    if (nominal->isBackDeployedIntoClient() && !hasEmbeddedExistentials)
+      return var;
+
     // Native Swift class metadata has a destructor before the address point.
     if (isa<ClassDecl>(nominal)) {
       adjustmentIndex = MetadataAdjustmentIndex::Class;
@@ -5532,12 +5586,18 @@ IRGenModule::getAddrOfTypeMetadata(CanType concreteType,
 
   bool foreign = nominal && requiresForeignTypeMetadata(nominal);
 
-  // Foreign classes and prespecialized generic types do not use an alias into
-  // the full metadata and therefore require a GEP.
+  // Back-deployed types are emitted with shared linkage into each client, and
+  // Mach-O alias symbols can't be weak definitions, so they have no alias
+  // either.
+  bool backDeployed = nominal && nominal->isBackDeployedIntoClient();
+
+  // Foreign classes, back-deployed types and prespecialized generic types do
+  // not use an alias into the full metadata and therefore require a GEP.
   bool fullMetadata =
       !Context.LangOpts.hasFeature(Feature::Embedded) &&
-      (foreign || (concreteType->getAnyGeneric() &&
-                  concreteType->getAnyGeneric()->isGenericContext()));
+      (foreign || backDeployed ||
+       (concreteType->getAnyGeneric() &&
+        concreteType->getAnyGeneric()->isGenericContext()));
 
   llvm::Type *defaultVarTy;
   unsigned adjustmentIndex;

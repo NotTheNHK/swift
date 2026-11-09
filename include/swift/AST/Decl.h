@@ -70,6 +70,7 @@ namespace swift {
   enum class AccessSemantics : unsigned char;
   class AccessorDecl;
   class ApplyExpr;
+  class AvailabilityQuery;
   class AvailabilityRange;
   class AvailabilityDomain;
   class GenericEnvironment;
@@ -1233,6 +1234,19 @@ public:
   /// Returns true if the decl has a valid and active `@backDeployed` attribute.
   bool isBackDeployed() const;
 
+  /// Whether this declaration, nested in a back-deployed type, is annotated
+  /// as only available within \p backDeployedRange, where the type's defining
+  /// module provides the type, on the primary target or on the target variant.
+  /// Such a declaration isn't back-deployed along with the type.
+  bool isOnlyAvailableWithinBackDeployedRange(
+      AvailabilityRange backDeployedRange, bool forTargetVariant = false) const;
+
+  /// The query that determines at runtime whether the original of this
+  /// back-deployed declaration is available, accounting for both the primary
+  /// target and the target variant, or \c std::nullopt if this declaration
+  /// isn't back-deployed.
+  std::optional<AvailabilityQuery> getBackDeploymentAvailabilityQuery() const;
+
   /// Returns the starting location of the entire declaration.
   SourceLoc getStartLoc() const { return getSourceRange().Start; }
 
@@ -1798,6 +1812,9 @@ public:
   /// getGenericParams() this will not synthesize generic parameters for
   /// extensions, protocols and certain type aliases.
   GenericParamList *getParsedGenericParams() const;
+
+  /// Whether this context has generic parameters written in source.
+  bool hasParsedGenericParamList() const { return getParsedGenericParams(); }
 
   /// Determine whether this context has generic parameters
   /// of its own.
@@ -2822,6 +2839,11 @@ public:
 
   SourceRange getOriginalInitRange(unsigned i) const {
     return getPatternList()[i].getOriginalInitRange();
+  }
+
+  /// Retrieve the SourceRange for the pattern binding entry at a given index.
+  SourceRange getEntrySourceRange(unsigned i) const {
+    return getPatternList()[i].getSourceRange();
   }
 
   void setInit(unsigned i, Expr *E) {
@@ -4740,6 +4762,19 @@ public:
   /// is built resiliently.
   bool isResilient() const;
 
+  /// Whether this is a back-deployed struct or enum from a module other than
+  /// the one being compiled, and the deployment target doesn't guarantee that
+  /// its module provides it, so that the module being compiled emits its own
+  /// copy of the type's metadata and conformances.
+  bool isBackDeployedIntoClient() const;
+
+  /// Whether the module being compiled emits its own copy of a conformance of
+  /// this type that is declared in \p conformanceDC: that is, this type is
+  /// back-deployed into the client (\c isBackDeployedIntoClient), and the
+  /// conformance is declared alongside it, in the same module, and isn't only
+  /// available where that module provides the type.
+  bool emitsConformanceIntoClient(const DeclContext *conformanceDC) const;
+
   /// True if the decl is resilient AND also its defining module does
   /// _not_ allow non-resilient access; the module can allow such access
   /// if package optimization is enabled so its client modules within the
@@ -6443,6 +6478,11 @@ public:
   /// it.
   bool hasStorage() const;
 
+  void setHasStorage(bool hasStorage) {
+    LazySemanticInfo.HasStorage = hasStorage;
+    LazySemanticInfo.HasStorageComputed = true;
+  }
+
   /// Return true if this is a VarDecl that has init accessor associated
   /// with it.
   bool hasInitAccessor() const;
@@ -7597,6 +7637,10 @@ public:
   /// such as the magic literal \c #function.
   bool hasCallerSideDefaultExpr() const;
 
+  /// Whether this parameter's default argument is evaluated by a generator
+  /// function, rather than at the call site or by an overridden declaration.
+  bool hasDefaultArgumentGenerator() const;
+
   /// Retrieve the fully type-checked default argument expression for this
   /// parameter, or \c nullptr if there is no default expression.
   ///
@@ -8740,10 +8784,20 @@ public:
   /// instance method.
   bool isObjCInstanceMethod() const;
 
+  /// Whether this is a top-level (module-scope) function with @objc (SE-0495).
+  bool isObjCGlobalFunction() const;
+
   /// Get the foreign language targeted by a @c-style attribute, if any.
   /// Used to abstract away the change in meaning of @c vs @_cdecl while
   /// formalizing the attribute.
   std::optional<ForeignLanguage> getCDeclKind() const;
+
+  /// Whether this function's signature includes types that require Objective-C
+  /// bridging (e.g. String <-> NSString). Used by @objc global functions to
+  /// decide between the @c single-symbol model and the @_cdecl thunk model.
+  /// This always examines the declaration's interface types; substitutions at
+  /// a use site must not change the declaration's entry-point model.
+  bool signatureRequiresObjCBridging() const;
 
   /// Determine whether the name of an argument is an API name by default
   /// depending on the function context.
@@ -9439,7 +9493,6 @@ public:
 
   /// Returns the string for the base name, or "_" if this is unnamed.
   StringRef getNameStr() const {
-    assert(!getName().isSpecial() && "Cannot get string for special names");
     return hasName() ? getBaseIdentifier().str() : "_";
   }
 

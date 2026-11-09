@@ -333,6 +333,8 @@ private:
   /// deinits must be specialized before IRGen runs.
   std::vector<SILType> noncopyableTypesWithEmittedMetadata;
 
+  std::vector<CanType> exportedTypeSpecializations;
+
   /// Declarations which are externally visible.
   ///
   /// These are method declarations which are referenced from inlinable
@@ -446,6 +448,11 @@ private:
   // Specialization attributes which need to be added to a function once it is created.
   // The key of this map is the function name.
   llvm::StringMap<std::vector<SILSpecializeAttr *>> pendingSpecializeAttrs;
+
+  /// The exported specialized bodies, e.g. 'sum<Int>', that '@specialized'
+  /// declarations without a body or extensions ask for, in this module or in
+  /// imported ones, each with whether this module creates it.
+  llvm::StringMap<bool> exportedSpecializationsOfImportedFunctions;
 
   SILModule(llvm::PointerUnion<FileUnit *, ModuleDecl *> context,
             Lowering::TypeConverter &TC, const SILOptions &Options,
@@ -724,6 +731,17 @@ public:
 
   void addNonCopyableTypeWithEmittedMetadata(SILType type) {
     noncopyableTypesWithEmittedMetadata.push_back(type);
+  }
+
+  /// The specializations that exported '@specialized' attributes on types
+  /// declared in this module declare. In Embedded Swift, this module emits
+  /// their metadata.
+  ArrayRef<CanType> getExportedTypeSpecializations() const {
+    return exportedTypeSpecializations;
+  }
+
+  void addExportedTypeSpecialization(CanType type) {
+    exportedTypeSpecializations.push_back(type);
   }
 
   using moveonlydeinit_iterator = SILMoveOnlyDeinitListType::iterator;
@@ -1244,6 +1262,23 @@ public:
 
   void addPendingSpecializeAttr(StringRef functionName, SILSpecializeAttr *attr) {
     pendingSpecializeAttrs[functionName].push_back(attr);
+  }
+
+  /// Records the exported specialized body of \p target, a function of another
+  /// module, for \p specializedSig, which a '@specialized' declaration without
+  /// a body or extension asks for: in this module if \p createdHere, else in
+  /// an imported module.
+  void addExportedSpecializationOfImportedFunction(
+      SILDeclRef target, GenericSignature specializedSig, bool createdHere);
+
+  /// Whether \p name is such an exported specialized body.
+  bool isExportedSpecializationOfImportedFunction(StringRef name) const {
+    return exportedSpecializationsOfImportedFunctions.contains(name);
+  }
+
+  /// Whether this module creates \p name, such an exported specialized body.
+  bool createsExportedSpecializationOfImportedFunction(StringRef name) const {
+    return exportedSpecializationsOfImportedFunctions.lookup(name);
   }
 };
 

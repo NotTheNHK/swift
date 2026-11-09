@@ -414,7 +414,6 @@ extension Task where Success == Never, Failure == Never {
   ///
   /// - SeeAlso: `isCancelled()`
   /// - SeeAlso: ``CancellationError/Reason``
-  @_unavailableInEmbedded
   public static func checkCancellation() throws {
     if Task<Never, Never>.isCancelled {
       if #available(StdlibDeploymentTarget 6.5, *) {
@@ -493,8 +492,11 @@ extension CancellationError {
   /// Create a `CancellationError` with a specific `Reason`.
   ///
   /// The `reason` is then accessible via the error's `reason` property.
+  // Not `@export(implementation)`: an inlined body would call the accessors of
+  // `_reasonRawStorage`, which have the type's 5.1 availability and therefore
+  // get strongly linked even behind `if #available`. Older runtimes don't have
+  // them, so a client would fail to load.
   @available(StdlibDeploymentTarget 6.5, *)
-  @export(implementation)
   public init(reason: Reason) {
     self.init()
     self._reasonRawStorage = reason._rawValue
@@ -506,8 +508,8 @@ extension CancellationError {
   /// by the runtime, e.g. when `Task.checkCancellation()` throws) report
   /// `.unspecified`. Errors constructed via `init(reason:)` report the
   /// specified reason.
+  // Not `@export(implementation)`, see `init(reason:)`.
   @available(StdlibDeploymentTarget 6.5, *)
-  @export(implementation)
   public var reason: Reason {
     Reason(_rawValue: _reasonRawStorage) ?? .unspecified
   }

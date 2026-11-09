@@ -32,6 +32,7 @@ import ArraySliceTests
 import ArraySubscript
 import ArrayTests
 import AssumeIsolated
+import AsyncStreamYield
 import AsyncTree
 import BinaryFloatingPointConversionFromBinaryInteger
 import BinaryFloatingPointProperties
@@ -56,17 +57,19 @@ import CharacterRecognizer
 import Chars
 import ChildTaskCreation
 import ClassArrayGetter
+import ClockMeasure
 import CodableTest
 import Combos
 import ContiguousArrayTests
+import ContinuationResume
 import CountAlgo
 import CreateObjects
 // rdar://128520766
-// import CxxSetToCollection
+import CxxSetToCollection
 import CxxSpanTests
 import CxxStringConversion
 // rdar://128520766
-// import CxxVectorSum
+import CxxVectorSum
 import DataBenchmarks
 import DeadArray
 import DevirtualizeProtocolComposition
@@ -199,6 +202,7 @@ import SortLargeExistentials
 import SortLettersInPlace
 import SortStrings
 import SpanTests
+import SpecializedWitnessTable
 import StaticArray
 import StrComplexWalk
 import StrToInt
@@ -255,6 +259,7 @@ register(ArraySliceTests.benchmarks)
 register(ArraySubscript.benchmarks)
 register(ArrayTests.benchmarks)
 register(AssumeIsolated.benchmarks)
+register(AsyncStreamYield.benchmarks)
 register(AsyncTree.benchmarks)
 register(BinaryFloatingPointConversionFromBinaryInteger.benchmarks)
 register(BinaryFloatingPointProperties.benchmarks)
@@ -281,15 +286,17 @@ register(ChildTaskCreation.benchmarks)
 register(CodableTest.benchmarks)
 register(Combos.benchmarks)
 register(ContiguousArrayTests.benchmarks)
+register(ContinuationResume.benchmarks)
 register(CountAlgo.benchmarks)
 register(ClassArrayGetter.benchmarks)
+register(ClockMeasure.benchmarks)
 register(CreateObjects.benchmarks)
 // rdar://128520766
-// register(CxxSetToCollection.benchmarks)
+register(CxxSetToCollection.benchmarks)
 register(CxxSpanTests.benchmarks)
 register(CxxStringConversion.benchmarks)
 // rdar://128520766
-// register(CxxVectorSum.benchmarks)
+register(CxxVectorSum.benchmarks)
 register(DataBenchmarks.benchmarks)
 register(DeadArray.benchmarks)
 register(DevirtualizeProtocolComposition.benchmarks)
@@ -423,6 +430,7 @@ register(SortLargeExistentials.benchmarks)
 register(SortLettersInPlace.benchmarks)
 register(SortStrings.benchmarks)
 register(SpanTests.benchmarks)
+register(SpecializedWitnessTable.benchmarks)
 register(StaticArray.benchmarks)
 register(StrComplexWalk.benchmarks)
 register(StrToInt.benchmarks)

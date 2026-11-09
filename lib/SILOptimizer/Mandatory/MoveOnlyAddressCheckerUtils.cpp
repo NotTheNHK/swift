@@ -427,11 +427,15 @@ using ScopeRequiringFinalInit = DiagnosticEmitter::ScopeRequiringFinalInit;
 ///     ...
 ///     end_apply %token // %addr must be initialized here
 ///
+///     The scope of self begins before the accessor is applied, so it may also
+///     end on paths that never reach the apply. Only the scope ends dominated
+///     by the apply are visited.
+///
 /// To enforce this requirement, function exiting instructions are treated as
 /// liveness uses of such addresses, ensuring that the address is initialized at
 /// that point.
 static bool visitScopeEndsRequiringInit(
-    MarkUnresolvedNonCopyableValueInst *markedAddr,
+    MarkUnresolvedNonCopyableValueInst *markedAddr, DominanceInfo *domTree,
     llvm::function_ref<void(SILInstruction *, ScopeRequiringFinalInit)> visit) {
   SILValue operand = markedAddr->getOperand();
 
@@ -506,12 +510,20 @@ static bool visitScopeEndsRequiringInit(
   if (auto ai =
           dyn_cast_or_null<ApplyInst>(operand->getDefiningInstruction())) {
     if (ai->hasInoutResult()) {
+      // The result is defined only on paths through the apply. A scope end
+      // that the apply does not dominate should not be visited.
+      auto visitDominated = [&](SILInstruction *inst,
+                                ScopeRequiringFinalInit kind) {
+        if (domTree->properlyDominates(ai, inst)) {
+          visit(inst, kind);
+        }
+      };
       auto *access =
           dyn_cast<BeginAccessInst>(getAccessScope(ai->getSelfArgument()));
       if (access) {
         assert(access->getAccessKind() == SILAccessKind::Modify);
         for (auto *inst : access->getEndAccesses()) {
-          visit(inst, ScopeRequiringFinalInit::ModifyMemoryAccess);
+          visitDominated(inst, ScopeRequiringFinalInit::ModifyMemoryAccess);
         }
         return true;
       }
@@ -519,7 +531,7 @@ static bool visitScopeEndsRequiringInit(
       // inout argument whose scope ends are those of its marker.
       if (auto *selfMark = dyn_cast<MarkUnresolvedNonCopyableValueInst>(
               stripAddressProjections(ai->getSelfArgument()))) {
-        return visitScopeEndsRequiringInit(selfMark, visit);
+        return visitScopeEndsRequiringInit(selfMark, domTree, visitDominated);
       }
       return false;
     }
@@ -868,7 +880,7 @@ struct UseState {
   initializeLiveness(FieldSensitiveMultiDefPrunedLiveRange &prunedLiveness);
 
   void initializeImplicitEndOfLifetimeLivenessUses() {
-    visitScopeEndsRequiringInit(address, [&](auto *inst, auto kind) {
+    visitScopeEndsRequiringInit(address, domTree, [&](auto *inst, auto kind) {
       LLVM_DEBUG(llvm::dbgs()
                  << "    Adding scope end as liveness user: " << *inst);
       scopeEndsRequiringInit[inst] = kind;
@@ -2221,6 +2233,45 @@ struct GatherUsesVisitor : public TransitiveAddressWalker<GatherUsesVisitor> {
     return markedValue->getFunction()->getASTContext();
   }
 
+  /// Classify \p op, whose user takes or copies the marked memory, as a consume
+  /// of \p leafRange. A copy of a noncopyable value must really be a take, so
+  /// a copy is recorded as one that the dataflow converts to a take once it
+  /// knows that it is a last use.
+  void recordConsumeOfMarkedMemory(Operand *op, TypeTreeLeafTypeRange leafRange,
+                                   bool isTake) {
+    auto *user = op->getUser();
+    if (markedValue->getCheckKind() ==
+        MarkUnresolvedNonCopyableValueInst::CheckKind::NoConsumeOrAssign) {
+      if (isa<ProjectBoxInst>(stripAccessMarkers(markedValue->getOperand()))) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "Found mark must check [nocopy] use of escaping box: "
+                   << *user);
+        diagnosticEmitter.emitAddressEscapingClosureCaptureLoadedAndConsumed(
+            markedValue);
+        return;
+      }
+
+      LLVM_DEBUG(llvm::dbgs()
+                 << "Found mark must check [nocopy] error: " << *user);
+      diagnosticEmitter.emitAddressDiagnosticNoCopy(markedValue, user);
+      return;
+    }
+
+    // Whether we take or copy, this is going to be a consuming operation. Make
+    // sure to check if we semantically destructure.
+    checkForPartialMutation(
+        useState, diagnosticEmitter, PartialMutation::Kind::Consume, user,
+        op->get()->getType(), leafRange, PartialMutation::consume());
+
+    if (isTake) {
+      LLVM_DEBUG(llvm::dbgs() << "Found take: " << *user);
+      useState.recordTakeUse(user, leafRange);
+    } else {
+      LLVM_DEBUG(llvm::dbgs() << "Found copy: " << *user);
+      useState.recordCopyUse(user, leafRange);
+    }
+  }
+
   /// Returns true if we emitted an error.
   bool checkForExclusivityHazards(LoadInst *li) {
     BitfieldRef<SSAPrunedLiveness>::StackState state(liveness,
@@ -2442,41 +2493,12 @@ bool GatherUsesVisitor::visitUse(Operand *op) {
         continue;
       }
 
-      if (markedValue->getCheckKind() ==
-          MarkUnresolvedNonCopyableValueInst::CheckKind::NoConsumeOrAssign) {
-        if (isa<ProjectBoxInst>(
-                stripAccessMarkers(markedValue->getOperand()))) {
-          LLVM_DEBUG(llvm::dbgs()
-                     << "Found mark must check [nocopy] use of escaping box: "
-                     << *user);
-          diagnosticEmitter.emitAddressEscapingClosureCaptureLoadedAndConsumed(
-              markedValue);
-          continue;
-        }
-
-        LLVM_DEBUG(llvm::dbgs()
-                   << "Found mark must check [nocopy] error: " << *user);
-        diagnosticEmitter.emitAddressDiagnosticNoCopy(markedValue, copyAddr);
-        continue;
-      }
-
       // TODO: Add borrow checking here like below.
 
       // If we have a copy_addr, we are either going to have a take or a
       // copy... in either case, this copy_addr /is/ going to be a consuming
-      // operation. Make sure to check if we semantically destructure.
-      checkForPartialMutation(useState, diagnosticEmitter,
-                              PartialMutation::Kind::Consume, op->getUser(),
-                              op->get()->getType(), leafRange,
-                              PartialMutation::consume());
-
-      if (copyAddr->isTakeOfSrc()) {
-        LLVM_DEBUG(llvm::dbgs() << "Found take: " << *user);
-        useState.recordTakeUse(user, leafRange);
-      } else {
-        LLVM_DEBUG(llvm::dbgs() << "Found copy: " << *user);
-        useState.recordCopyUse(user, leafRange);
-      }
+      // operation.
+      recordConsumeOfMarkedMemory(op, leafRange, copyAddr->isTakeOfSrc());
     }
     return true;
   }
@@ -2515,6 +2537,28 @@ bool GatherUsesVisitor::visitUse(Operand *op) {
           break;
         }
       }
+      return true;
+    }
+
+    // SILGen emits a Builtin.reinterpretCast of a noncopyable value as a load
+    // whose value is bit cast. That copies the bits out of the memory, so
+    // classify the load like the copy_addr that the address-only form of the
+    // cast uses: as a consume. Neither the borrow to destructure transform nor
+    // the canonicalizer could do this, since they cannot see through an
+    // unchecked_bitwise_cast (a PointerEscape).
+    if (llvm::any_of(li->getUses(), [](Operand *use) {
+          return isa<UncheckedBitwiseCastInst>(use->getUser());
+        })) {
+      SmallVector<TypeTreeLeafTypeRange, 2> leafRanges;
+      TypeTreeLeafTypeRange::get(op, getRootAddress(), leafRanges);
+      if (!leafRanges.size()) {
+        LLVM_DEBUG(llvm::dbgs() << "Failed to form leaf type range!\n");
+        return false;
+      }
+
+      for (auto leafRange : leafRanges)
+        recordConsumeOfMarkedMemory(op, leafRange,
+                                    qualifier == LoadOwnershipQualifier::Take);
       return true;
     }
 
@@ -2733,6 +2777,23 @@ bool GatherUsesVisitor::visitUse(Operand *op) {
   }
 
   auto *ccabi = dyn_cast<CheckedCastAddrBranchInst>(user);
+
+  // A conditional cast initializes Dest only when it succeeds, so record the
+  // init at the entry of the success block, as with a TakeOnSuccess Src.
+  if (ccabi && ccabi->getDest() == op->get()) {
+    LLVM_DEBUG(llvm::dbgs() << "Found checked_cast_addr_br Dest: " << *user);
+    SmallVector<TypeTreeLeafTypeRange, 2> leafRanges;
+    TypeTreeLeafTypeRange::get(op, getRootAddress(), leafRanges);
+    if (!leafRanges.size()) {
+      LLVM_DEBUG(llvm::dbgs() << "Failed to form leaf type range!\n");
+      return false;
+    }
+    for (auto leafRange : leafRanges)
+      useState.recordInitUse(&ccabi->getSuccessBB()->front(), op->get(),
+                             leafRange);
+    return true;
+  }
+
   if (ccabi && ccabi->getSrc() == op->get()) {
     LLVM_DEBUG(llvm::dbgs() << "Found checked_cast_addr_br Src: "
                             << *user);
@@ -4010,6 +4071,12 @@ void ExtendUnconsumedLiveness::runOnField(
   for (auto *block : consumedAtEntryBlocks) {
     for (auto *predecessor : block->getPredecessorBlocks()) {
       if (consumedAtExitBlocks.contains(predecessor))
+        continue;
+      // A predecessor that wasn't originally live isn't on that boundary. For
+      // example, when the field is defined in a loop header and consumed in the
+      // loop, the header is consumed at entry along the back edge, but the
+      // field isn't live in the loop's preheader at all.
+      if (!originalLiveBlocks.contains(predecessor))
         continue;
       // Add "the instruction(s) before the terminator" of the predecessor to
       // liveness.

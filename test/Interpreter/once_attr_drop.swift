@@ -5,13 +5,17 @@
 
 // Each case that calls a closure runs to completion, and each case that drops
 // one terminates the program. Dropping goes through
-// withoutActuallyDiscarding, which is the only way to drop an exactly-once
+// withoutActuallyDeiniting, which is the only way to drop an exactly-once
 // closure.
 //
 // RUN: %target-run %t/onone.out call | %FileCheck %s --check-prefix=CALL-call
 // RUN: %target-run %t/opt.out call | %FileCheck %s --check-prefix=CALL-call
 // RUN: %target-run %t/onone.out callWithResource | %FileCheck %s --check-prefix=CALL-callWithResource
 // RUN: %target-run %t/opt.out callWithResource | %FileCheck %s --check-prefix=CALL-callWithResource
+// RUN: %target-run %t/onone.out callOrForwardDirect | %FileCheck %s --check-prefix=CALL-callOrForward
+// RUN: %target-run %t/opt.out callOrForwardDirect | %FileCheck %s --check-prefix=CALL-callOrForward
+// RUN: %target-run %t/onone.out callOrForwardForwarded | %FileCheck %s --check-prefix=CALL-callOrForward
+// RUN: %target-run %t/opt.out callOrForwardForwarded | %FileCheck %s --check-prefix=CALL-callOrForward
 // RUN: %target-run %t/onone.out callEscaping | %FileCheck %s --check-prefix=CALL-callEscaping
 // RUN: %target-run %t/opt.out callEscaping | %FileCheck %s --check-prefix=CALL-callEscaping
 // RUN: %target-run %t/onone.out callGlobal | %FileCheck %s --check-prefix=CALL-callGlobal
@@ -34,6 +38,14 @@
 // RUN: %target-run %t/opt.out callGenericInout | %FileCheck %s --check-prefix=CALL-callGenericInout
 // RUN: %target-run %t/onone.out callGenericConsumingAndInout | %FileCheck %s --check-prefix=CALL-callGenericConsumingAndInout
 // RUN: %target-run %t/opt.out callGenericConsumingAndInout | %FileCheck %s --check-prefix=CALL-callGenericConsumingAndInout
+// RUN: %target-run %t/onone.out callInlined | %FileCheck %s --check-prefix=CALL-callInlined
+// RUN: %target-run %t/opt.out callInlined | %FileCheck %s --check-prefix=CALL-callInlined
+// RUN: %target-run %t/onone.out callInlinedRebound | %FileCheck %s --check-prefix=CALL-callInlinedRebound
+// RUN: %target-run %t/opt.out callInlinedRebound | %FileCheck %s --check-prefix=CALL-callInlinedRebound
+// RUN: %target-run %t/onone.out callInlinedForwarded | %FileCheck %s --check-prefix=CALL-callInlinedForwarded
+// RUN: %target-run %t/opt.out callInlinedForwarded | %FileCheck %s --check-prefix=CALL-callInlinedForwarded
+// RUN: %target-run %t/onone.out callThroughThunk | %FileCheck %s --check-prefix=CALL-callThroughThunk
+// RUN: %target-run %t/opt.out callThroughThunk | %FileCheck %s --check-prefix=CALL-callThroughThunk
 //
 // RUN: not --crash env %env-SWIFT_BACKTRACE=enable=no %target-run %t/onone.out drop 2>&1 | %FileCheck %s --check-prefix=DROP
 // RUN: not --crash env %env-SWIFT_BACKTRACE=enable=no %target-run %t/opt.out drop 2>&1 | %FileCheck %s --check-prefix=DROP
@@ -90,6 +102,23 @@ func call(_ f: @once () -> Void) {
   print("called")
 }
 
+@_optimize(none)
+func forward(_ f: @once () -> Void) {
+  f()
+}
+
+// One path calls the closure and the other forwards it, so the closure can't
+// be deleted after the call is optimized into a direct call.
+@inline(__always)
+func callOrForward(_ direct: Bool, _ f: @once () -> Void) {
+  if direct {
+    f()
+  } else {
+    forward(f)
+  }
+  print("called")
+}
+
 @inline(never)
 func callEscaping(_ f: @escaping @once () -> Void) {
   f()
@@ -98,12 +127,12 @@ func callEscaping(_ f: @escaping @once () -> Void) {
 
 @inline(never)
 func drop(_ f: consuming @once () -> Void) {
-  withoutActuallyDiscarding(f) { _ in }
+  withoutActuallyDeiniting(f) { _ in }
 }
 
 @inline(never)
 func dropEscaping(_ f: consuming @escaping @once () -> Void) {
-  withoutActuallyDiscarding(f) { _ in }
+  withoutActuallyDeiniting(f) { _ in }
 }
 
 @inline(never)
@@ -237,6 +266,34 @@ func dropMixed(_ consumed: consuming Resource, _ borrowed: consuming Resource) {
   }
 }
 
+@_transparent
+func transparentCall(_ f: @once () -> Void) {
+  f()
+  print("called")
+}
+
+@_transparent
+func transparentRebound(_ f: @once () -> Void) {
+  let g = f
+  g()
+  print("called")
+}
+
+@_transparent
+func transparentForwarded(_ f: @once () -> Void) {
+  transparentRebound(f)
+}
+
+@inline(never)
+func genericCall<R>(_ f: @once () -> R) -> R {
+  let result = f()
+  print("called")
+  return result
+}
+
+@inline(never)
+func makeGreeting() -> String { "hello" }
+
 @inline(never)
 func run(_ which: String, _ box: Box, _ resource: consuming Resource) {
   switch which {
@@ -244,6 +301,8 @@ func run(_ which: String, _ box: Box, _ resource: consuming Resource) {
     call { box.count += 1 }
   case "callWithResource":
     call { _ = consume resource }
+  case "callOrForwardDirect", "callOrForwardForwarded":
+    callOrForward(which == "callOrForwardDirect") { _ = consume resource }
   case "callEscaping":
     callEscaping { box.count += 1 }
   case "callGlobal":
@@ -266,6 +325,14 @@ func run(_ which: String, _ box: Box, _ resource: consuming Resource) {
     dropEscaping { print("never") }
   case "dropGlobal":
     dropEscaping(hello)
+  case "callInlined":
+    transparentCall { _ = consume resource }
+  case "callInlinedRebound":
+    transparentRebound { _ = consume resource }
+  case "callInlinedForwarded":
+    transparentForwarded { _ = consume resource }
+  case "callThroughThunk":
+    print(genericCall(makeGreeting))
   case "dropAfterCalls":
     // Closures that share a context must not change the outcome of a later
     // drop.
@@ -313,12 +380,31 @@ default:
 // CALL-callWithResource: Resource r deinit
 // CALL-callWithResource-NEXT: called
 
+// CALL-callOrForward: Resource r deinit
+// CALL-callOrForward-NEXT: called
+
 // CALL-callEscaping: called
 // CALL-callEscaping-NEXT: Resource r deinit
 
 // CALL-callGlobal: hello
 // CALL-callGlobal-NEXT: called
 // CALL-callGlobal-NEXT: Resource r deinit
+
+// CALL-callInlined: Resource r deinit
+// CALL-callInlined-NEXT: called
+// CALL-callInlined-NOT: deinit
+
+// CALL-callInlinedRebound: Resource r deinit
+// CALL-callInlinedRebound-NEXT: called
+// CALL-callInlinedRebound-NOT: deinit
+
+// CALL-callInlinedForwarded: Resource r deinit
+// CALL-callInlinedForwarded-NEXT: called
+// CALL-callInlinedForwarded-NOT: deinit
+
+// CALL-callThroughThunk: called
+// CALL-callThroughThunk-NEXT: hello
+// CALL-callThroughThunk-NEXT: Resource r deinit
 
 // CALL-callCaptureless: body
 // CALL-callCaptureless-NEXT: called

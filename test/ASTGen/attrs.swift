@@ -88,6 +88,9 @@ struct S4 {}
 @abi(func fn_abi()) // expected-error {{cannot give global function 'fn' the ABI of a global function with a different number of parameters}}
 func fn(_: Int) {}
 
+@abi(var globalVar_abi: Int)
+var globalVar: Int = 0
+
 @_alignment(8) struct AnyAlignment {}
 
 @_allowFeatureSuppression(IsolatedAny) public func testFeatureSuppression(fn: @isolated(any) @Sendable () -> ()) {}
@@ -181,7 +184,7 @@ func testSpecialize<X, Y, Z>(x: X, y: Y, z: Z) {}
 func testSpecializePublic<X, Y, Z>(x: X, y: Y, z: Z) {}
 
 @specialized(exported: true, where X == Int)
-func testSpecializeExported<X>(x: X) {}
+public func testSpecializeExported<X>(x: X) {}
 
 @_spi(SPIName) public func spiFn() {}
 

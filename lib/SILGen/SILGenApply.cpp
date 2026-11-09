@@ -197,7 +197,11 @@ static bool canUseStaticDispatch(SILGenFunction &SGF,
   if (constant.kind == SILDeclRef::Kind::Initializer
       && !constant.isForeign)
     return true;
-  
+
+  // So are C++ constructors that initialize a foreign reference type.
+  if (constant.isForeignReferenceInitializer())
+    return true;
+
   // Extension methods currently must be statically dispatched, unless they're
   // @objc or dynamic.
   if (isa<ExtensionDecl>(funcDecl->getDeclContext()) && !constant.isForeign)
@@ -670,6 +674,12 @@ public:
     if (isa_and_nonnull<clang::CXXConstructorDecl>(
             constant->getDecl()->getClangDecl()))
       result.foreign.self.setStatic();
+
+    // A C++ constructor that initializes a foreign reference type is imported
+    // as a static factory, but its initializing entry point takes `self` as
+    // the trailing `this` argument, like a C++ instance method.
+    if (constant->isForeignReferenceInitializer())
+      result.foreign.self = ImportAsMemberStatus();
 
     return result;
   }
@@ -3995,6 +4005,16 @@ private:
       }
       if (auto addr = SGF.tryEmitAddressableParameterAsAddress(std::move(arg),
                                                               paramOwnership)) {
+        // Under opaque values, an addressable parameter is still lowered as an
+        // '@in_guaranteed' parameter, but that is a by-value object rather than
+        // an address. Load the addressable buffer so the argument matches the
+        // callee's convention. AddressLowering forwards the buffer's address
+        // back into the call, which keeps the address stable.
+        if (!SGF.silConv.isSILIndirect(ParamInfos.front())) {
+          assert(paramOwnership == ValueOwnership::Shared &&
+                 "only guaranteed addressable parameters can be object typed");
+          addr = SGF.emitManagedLoadBorrow(ApplyLoc, addr.getValue());
+        }
         claimNextParameters(1);
         Args.push_back(addr);
         return;
@@ -5547,22 +5567,48 @@ private:
 
 namespace {
 /// Cleanup to end a coroutine application.
-class EndCoroutineApply : public Cleanup {
+///
+/// The borrows to end before the coroutine is ended live in a tail allocated
+/// after the cleanup (see CleanupManager::pushCleanupWithTail), since cleanups
+/// are memcpy'd around and never destroyed, so they cannot own memory. The
+/// tail is read relative to 'this' because the cleanup stack relocates
+/// cleanups.
+class EndCoroutineApply final
+    : public Cleanup,
+      private llvm::TrailingObjects<EndCoroutineApply, BeginBorrowInst *> {
+  friend TrailingObjects;
+
   SILValue ApplyToken;
   bool CanUnwind;
-  std::vector<BeginBorrowInst *> BorrowedMoveOnlyValues;
+  unsigned NumBorrowedMoveOnlyValues = 0;
+
+  ArrayRef<BeginBorrowInst *> getBorrowedMoveOnlyValues() {
+    return getTrailingObjects(NumBorrowedMoveOnlyValues);
+  }
+
 public:
+  /// The tail size to push this cleanup with, to hold up to \p capacity
+  /// borrows.
+  static size_t getTailSize(unsigned capacity) {
+    return additionalSizeToAlloc<BeginBorrowInst *>(capacity);
+  }
+
   EndCoroutineApply(SILValue applyToken, bool CanUnwind)
       : ApplyToken(applyToken), CanUnwind(CanUnwind) {}
 
   void setBorrowedMoveOnlyValues(ArrayRef<BeginBorrowInst *> values) {
-    BorrowedMoveOnlyValues.insert(BorrowedMoveOnlyValues.end(),
-                                  values.begin(), values.end());
+    assert(NumBorrowedMoveOnlyValues == 0 && "borrowed values already set");
+    assert(getTailSize(values.size()) <=
+               allocated_size() - sizeof(EndCoroutineApply) &&
+           "not enough tail storage for the borrowed values");
+    llvm::copy(values, getTrailingObjects());
+    NumBorrowedMoveOnlyValues = values.size();
   }
 
   void emit(SILGenFunction &SGF, CleanupLocation l, ForUnwind_t forUnwind) override {
-    for (auto i = BorrowedMoveOnlyValues.rbegin(), e = BorrowedMoveOnlyValues.rend();
-         i != e; ++i) {
+    auto borrowedValues = getBorrowedMoveOnlyValues();
+    for (auto i = borrowedValues.rbegin(), e = borrowedValues.rend(); i != e;
+         ++i) {
       SGF.B.createEndBorrow(l, *i);
       SGF.B.createDestroyValue(l, (*i)->getOperand());
     }
@@ -5633,7 +5679,8 @@ CleanupHandle SILGenFunction::emitBeginApply(
 
   // Push a cleanup to end the application.
   // TODO: destroy all the arguments at exactly this point?
-  Cleanups.pushCleanup<EndCoroutineApply>(token, canUnwind);
+  Cleanups.pushCleanupWithTail<EndCoroutineApply>(
+      EndCoroutineApply::getTailSize(yieldValues.size()), token, canUnwind);
   auto endApplyHandle = getTopCleanup();
 
   // Manage all the yielded values.
@@ -7842,7 +7889,9 @@ ArgumentSource AccessorBaseArgPreparer::prepareAccessorObjectBaseArg() {
     // as well. This isn't always true for copyable bases so be less aggressive
     // in that case.
     if (base.getType().isMoveOnly()) {
-      base = base.formalAccessBorrow(SGF, loc);
+      if (!selfParam.isConsumedInCaller()) {
+        base = base.formalAccessBorrow(SGF, loc);
+      }
     } else {
       base = base.formalAccessCopy(SGF, loc);
     }

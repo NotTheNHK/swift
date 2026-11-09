@@ -361,6 +361,8 @@ WARNING(unreachable_code_after_stmt,none,
         "be executed", (unsigned))
 WARNING(unreachable_case,none,
         "%select{case|default}0 will never be executed", (bool))
+NOTE(default_after_catchall,none,
+     "a 'default' case is equivalent to a catch-all case; remove one", ())
 WARNING(switch_on_a_constant,none,
         "switch condition evaluates to a constant", ())
 NOTE(unreachable_code_note,none, "will never be executed", ())
@@ -436,6 +438,8 @@ NOTE(embedded_existential_created,none,
       "protocol type value created here", ())
 NOTE(embedded_constructor_called,none,
       "instance of type created here", ())
+GROUPED_ERROR(embedded_variadic_generic, EmbeddedRestrictions, none,
+              "cannot specialize pack expression or statement in embedded Swift. This is a compiler bug. Please file a bug with a small example of the bug", ())
 
 // no-allocations diagnostics
 GROUPED_WARNING(embedded_swift_allocating_type,HeapAllocation,none,
@@ -494,6 +498,11 @@ ERROR(cannot_prespecialize,none,
 ERROR(missing_prespecialization,none,
       "Pre-specialized function %0 missing in SwiftOnoneSupport module",
       (StringRef))
+ERROR(specialized_declaration_body_unavailable,none,
+      "cannot export a specialization of %0, %select{whose body isn't "
+      "available to this module unless it's '@inlinable' or its module is "
+      "built with cross-module optimization|which can't be specialized, e.g. "
+      "because it's 'dynamic' or '@_optimize(none)'}1", (DeclName, bool))
 
 // Arithmetic diagnostics.
 ERROR(integer_conversion_overflow,none,
@@ -913,6 +922,8 @@ ERROR(sil_movechecking_value_used_after_consume, none,
       "'%0' used after consume", (StringRef))
 ERROR(sil_movechecking_guaranteed_value_consumed, none,
       "'%0' is borrowed and cannot be consumed", (StringRef))
+NOTE(sil_movechecking_add_explicit_copy, none,
+     "write 'copy %0' to keep '%0' valid after this consume", (StringRef))
 ERROR(sil_movechecking_borrowed_parameter_captured_by_closure, none,
       "'%0' cannot be captured by an escaping closure since it is a borrowed "
       "parameter",

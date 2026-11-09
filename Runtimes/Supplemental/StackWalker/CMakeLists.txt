@@ -44,7 +44,8 @@ add_compile_options(
   "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-Xfrontend -disable-implicit-concurrency-module-import>"
   "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-Xfrontend -disable-implicit-cxx-module-import>"
   "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-Xfrontend -disable-implicit-string-processing-module-import>"
-  "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-Xfrontend -disable-availability-checking>")
+  "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-Xfrontend -disable-availability-checking>"
+  "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-Xfrontend -enable-sil-opaque-values>")
 
 # LNK4049: symbol 'symbol' defined in 'filename.obj' is imported
 # LNK4286: symbol 'symbol' defined in 'filename_1.obj' is imported by 'filename_2.obj'
@@ -65,6 +66,7 @@ endif()
 add_executable(swift-backtrace
   main.swift
   AnsiColor.swift
+  EventLog.swift
   JSON.swift
   TargetMacOS.swift
   TargetLinux.swift

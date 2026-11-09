@@ -77,6 +77,7 @@
 #include "swift/Subsystems.h"
 #include "swift/SymbolGraphGen/SymbolGraphOptions.h"
 #include "clang/AST/Type.h"
+#include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
 #include "llvm/ADT/STLExtras.h"
@@ -3900,6 +3901,7 @@ TypeAliasType::TypeAliasType(TypeAliasDecl *typealias, Type parent,
                              RecursiveTypeProperties properties)
     : SugarType(TypeKind::TypeAlias, underlying, properties),
       typealias(typealias) {
+  ASSERT(isValidParent(parent));
   // Record the parent (or absence of a parent).
   if (parent) {
     Bits.TypeAliasType.HasParent = true;
@@ -3982,6 +3984,23 @@ void TypeAliasType::Profile(
   for (auto arg : genericArgs)
     id.AddPointer(arg.getPointer());
   id.AddPointer(underlying.getPointer());
+}
+
+bool TypeAliasType::isValidParent(Type ty) {
+  // Top-level is always fine.
+  if (!ty)
+    return true;
+
+  // Typealiases on protocols should be desugared.
+  if (ty->isAnyExistentialType())
+    return false;
+
+  // Parents with unbound generics cannot be represented. We diagnose any cases
+  // where a parent generic parameter is used in the underlying type.
+  if (ty->hasUnboundGenericType())
+    return false;
+
+  return true;
 }
 
 LocatableType::LocatableType(SourceLoc loc, Type underlying,
@@ -4142,6 +4161,15 @@ IntegerType *IntegerType::get(StringRef value, bool isNegative,
 
   ctx.getImpl().IntegerTypes.insert(intType, insertToken);
   return intType;
+}
+
+IntegerType *IntegerType::get(const APSInt &value, const ASTContext &ctx) {
+  bool isNegative = value.isNegative();
+
+  SmallString<16> countBuf;
+  (isNegative ? -value : value).toStringUnsigned(countBuf);
+
+  return IntegerType::get(countBuf, isNegative, ctx);
 }
 
 HiddenType *HiddenType::get(const ASTContext &ctx, StringRef mangledName,
@@ -4789,31 +4817,30 @@ NominalType *NominalType::get(NominalTypeDecl *D,
     break;
 
   case DeclKind::Protocol:
-    assert(genericArgs.empty());
-    return ProtocolType::get(cast<ProtocolDecl>(D), parent, C);
+    ASSERT(genericArgs.empty());
+    return ProtocolType::get(cast<ProtocolDecl>(D), parent);
 
   case DeclKind::BuiltinTuple:
-    assert(genericArgs.empty());
-    return BuiltinTupleType::get(cast<BuiltinTupleDecl>(D), parent, C);
+    ABORT("should not end up here with BuiltinTuple");
 
   default:
-    llvm_unreachable("not a nominal type declaration");
+    ABORT("not a nominal type declaration");
   }
 
-#ifndef NDEBUG
-  {
-    auto genericParams = D->getGenericParams();
-    assert(genericArgs.empty() == (genericParams == nullptr) &&
-           "params and args must match in presence");
-    if (genericParams) {
-      assert(genericArgs.size() == genericParams->getParams().size() &&
-             "params and args must match in number");
+  if (CONDITIONAL_ASSERT_enabled()) {
+    {
+      auto genericParams = D->getGenericParams();
+      ASSERT(genericArgs.empty() == (genericParams == nullptr) &&
+             "params and args must match in presence");
+      if (genericParams) {
+        ASSERT(genericArgs.size() == genericParams->getParams().size() &&
+               "params and args must match in number");
+      }
     }
+    ASSERT((!parent || parent->is<NominalType>() ||
+            parent->is<UnboundGenericType>()) &&
+           "parent must be a nominal type");
   }
-  assert((!parent || parent->is<NominalType>() ||
-          parent->is<UnboundGenericType>()) &&
-         "parent must be a nominal type");
-#endif
 
   llvm::FoldingSetNodeID ID;
   NominalType::Profile(ID, D, parent, genericArgs, scopeArgs);
@@ -6192,26 +6219,30 @@ OptionalType *OptionalType::get(Type base) {
   return entry = new (C, arena) OptionalType(C, base, properties);
 }
 
-ProtocolType *ProtocolType::get(ProtocolDecl *D, Type Parent,
-                                const ASTContext &C) {
+ProtocolType *ProtocolType::get(ProtocolDecl *D, Type Parent) {
   RecursiveTypeProperties properties;
   if (D->getExplicitSafety() == ExplicitSafety::Unsafe)
     properties |= RecursiveTypeProperties::IsUnsafe;
   properties |= getRecursivePropertiesAsParent(Parent);
   auto arena = getArena(properties);
 
+  auto &C = D->getASTContext();
+  bool isCanonical = !Parent || Parent->isCanonical();
+
   auto *&known = C.getImpl().getArena(arena).ProtocolTypes[{D, Parent}];
   if (!known) {
-    known = new (C, arena) ProtocolType(D, Parent, C, properties);
+    known = new (C, arena) ProtocolType(D, Parent,
+                                        isCanonical ? &C : nullptr,
+                                        properties);
   }
   return known;
 }
 
 ProtocolType::ProtocolType(ProtocolDecl *TheDecl, Type Parent,
-                           const ASTContext &Ctx,
+                           const ASTContext *Ctx,
                            RecursiveTypeProperties properties)
   : NominalType(TypeKind::Protocol, TheDecl, Parent, /*args*/ {},
-                &Ctx, properties) {}
+                Ctx, properties) {}
 
 Type ExistentialType::get(Type constraint) {
   auto &C = constraint->getASTContext();

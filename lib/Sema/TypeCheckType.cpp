@@ -353,6 +353,10 @@ Type TypeResolution::resolveTypeInContext(TypeDecl *typeDecl,
             if (auto *ugAliasDecl =
                     dyn_cast<TypeAliasDecl>(unboundGeneric->getAnyGeneric())) {
               if (ugAliasDecl == aliasDecl) {
+                // For an unbound type we have a "passthrough" alias and so
+                // can return the interface type of the typealias directly
+                // since any generic parameters it has will match the underlying
+                // type exactly.
                 if (getStage() == TypeResolutionStage::Structural &&
                     aliasDecl->getUnderlyingTypeRepr() != nullptr) {
                   return adjustAliasType(aliasDecl->getStructuralType());
@@ -366,13 +370,14 @@ Type TypeResolution::resolveTypeInContext(TypeDecl *typeDecl,
           }
           if (auto *aliasType =
                   dyn_cast<TypeAliasType>(extendedType.getPointer())) {
-            if (aliasType->getDecl() == aliasDecl) {
-              if (getStage() == TypeResolutionStage::Structural &&
-                  aliasDecl->getUnderlyingTypeRepr() != nullptr) {
-                return adjustAliasType(aliasDecl->getStructuralType());
-              }
-              return adjustAliasType(aliasDecl->getDeclaredInterfaceType());
-            }
+            // For a bound typealias type, we need to return the extended type
+            // directly. We can't return the interface type of the typealias
+            // itself since the generic signature of the extension does *not*
+            // contain any of the typealiases generic parameters, only those of
+            // the underlying nominal.
+            if (aliasType->getDecl() == aliasDecl)
+              return adjustAliasType(aliasType);
+
             extendedType = aliasType->getParent();
             continue;
           }
@@ -1540,9 +1545,13 @@ TypeResolver::applyGenericArguments(Type type, DeclRefTypeRepr *repr,
     if (inStage(TypeResolutionStage::Structural))
       return type;
 
+    // If we have a nested non-generic type, check the outer requirements. We
+    // can skip this for generic types since we'll check the requirements when
+    // applying the args.
     GenericTypeDecl *decl;
     Type parentTy;
-    if (auto *aliasTy = dyn_cast<TypeAliasType>(type.getPointer())) {
+    if (auto *aliasTy = dyn_cast<TypeAliasType>(type.getPointer());
+        aliasTy && aliasTy->getDirectGenericArgs().empty()) {
       decl = aliasTy->getDecl();
       parentTy = aliasTy->getParent();
     } else if (auto *nominalTy = type->getAs<NominalType>();
@@ -1806,9 +1815,8 @@ Type TypeResolution::applyUnboundGenericArguments(
         auto genericSig = decl->getGenericSignature();
         auto parentSig = decl->getDeclContext()->getGenericSignatureOfContext();
         for (auto gp : parentSig.getGenericParams()) {
-          ASSERT(genericSig->isConcreteType(gp));
-          subs[gp->getCanonicalType()->castTo<GenericTypeParamType>()] =
-              genericSig->getConcreteType(gp);
+          if (auto sub = genericSig->getConcreteType(gp))
+            subs[gp->getCanonicalType()->castTo<GenericTypeParamType>()] = sub;
         }
       }
 
@@ -1926,7 +1934,7 @@ Type TypeResolution::applyUnboundGenericArguments(
   }
 
   // Form a sugared typealias reference if necessary.
-  if (typeAliasDecl && (!parentTy || !parentTy->isAnyExistentialType())) {
+  if (typeAliasDecl && TypeAliasType::isValidParent(parentTy)) {
     resultType = TypeAliasType::get(typeAliasDecl, parentTy, genericArgs,
                                     resultType);
   }
@@ -4408,29 +4416,29 @@ TypeResolver::resolveASTFunctionTypeParams(TupleTypeRepr *inputRepr,
     }
 
     if (auto *fnTy = ty->getAs<AnyFunctionType>()) {
-      if (fnTy->hasCalledAtMostOnceSemantics()) {
-      switch (ownership) {
-      case ParamSpecifier::Borrowing:
-      case ParamSpecifier::LegacyShared:
-        diagnose(
-            eltTypeRepr->getLoc(),
-            diag::execution_semantics_attr_cannot_be_used_with_borrowing,
-            getExecutionSemanticsAttrSpelling(*fnTy->getExecutionSemantics()));
-        elements.emplace_back(ErrorType::get(getASTContext()));
-        continue;
+      if (fnTy->isCallConsuming()) {
+        switch (ownership) {
+        case ParamSpecifier::Borrowing:
+        case ParamSpecifier::LegacyShared:
+          diagnose(eltTypeRepr->getLoc(),
+                   diag::execution_semantics_attr_cannot_be_used_with_borrowing,
+                   getExecutionSemanticsAttrSpelling(
+                       *fnTy->getExecutionSemantics()));
+          elements.emplace_back(ErrorType::get(getASTContext()));
+          continue;
 
-      case ParamSpecifier::InOut:
-      case ParamSpecifier::Consuming:
-      case ParamSpecifier::LegacyOwned:
-      // used by `sending`
-      case ParamSpecifier::ImplicitlyCopyableConsuming:
-        break;
-      // at-most-once is consuming by default and we don't
-      // require it be to written explicitly.
-      case ParamSpecifier::Default:
-        ownership = ParamSpecifier::Consuming;
-        break;
-      }
+        case ParamSpecifier::InOut:
+        case ParamSpecifier::Consuming:
+        case ParamSpecifier::LegacyOwned:
+        // used by `sending`
+        case ParamSpecifier::ImplicitlyCopyableConsuming:
+          break;
+        // at-most-once is consuming by default and we don't
+        // require it be to written explicitly.
+        case ParamSpecifier::Default:
+          ownership = ParamSpecifier::Consuming;
+          break;
+        }
       }
     }
 
@@ -6392,9 +6400,9 @@ TypeResolver::resolveOwnershipTypeRepr(OwnershipTypeRepr *repr,
   case ParamSpecifier::Consuming:
     if (auto *fnTy = result->getAs<FunctionType>()) {
       if (fnTy->isNoEscape()) {
-        // at-most-once functions always have consuming semantics
-        // regardless of whether they are @escaping or not.
-        if (fnTy->hasCalledAtMostOnceSemantics())
+        // A noncopyable function can be consumed regardless of whether it
+        // is @escaping or not.
+        if (fnTy->isNoncopyable())
           break;
 
         diagnoseInvalid(ownershipRepr, ownershipRepr->getLoc(),
@@ -7699,9 +7707,8 @@ Type TypeChecker::substMemberTypeWithBase(TypeDecl *member,
 
   // If we're referring to a typealias within a generic context, build
   // a sugared alias type.
-  if (aliasDecl && (!sugaredBaseTy || !sugaredBaseTy->isAnyExistentialType())) {
+  if (aliasDecl && TypeAliasType::isValidParent(sugaredBaseTy))
     resultType = TypeAliasType::get(aliasDecl, sugaredBaseTy, {}, resultType);
-  }
 
   // However, if overload resolution finds a value generic decl from name
   // lookup, replace the returned member type to be the underlying value type

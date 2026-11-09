@@ -12,6 +12,7 @@
 
 #define DEBUG_TYPE "closure-lifetime-fixup"
 
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/SIL/BasicBlockDatastructures.h"
 #include "swift/SIL/DebugUtils.h"
@@ -476,9 +477,9 @@ swift::getNonEscapingClosureConversion(PartialApplyInst *pai) {
     return nullptr;
 
   // Only a [not_guaranteed] conversion is promoted unless the closure is
-  // at-most-once. See fixupClosureLifetimes.
+  // noncopyable. See fixupClosureLifetimes.
   if (cvt->isLifetimeGuaranteed() &&
-      !cvt->getType().hasCalledAtMostOnceSemantics())
+      !cvt->getType().castTo<SILFunctionType>()->isNoncopyable())
     return nullptr;
 
   if (getStackPromotablePartialApply(cvt) != pai)
@@ -524,10 +525,9 @@ static SILValue insertMarkDependenceForCapturedArguments(PartialApplyInst *pai,
       if (m->hasGuaranteedInitialKind())
         continue;
 
-    // An at-most-once closure's on-stack context takes ownership of its
+    // A noncopyable closure's on-stack context takes ownership of its
     // Copyable captures directly.
-    if (pai->hasCalledAtMostOnceSemantics() &&
-        !arg.get()->getType().isAddress())
+    if (pai->isNoncopyable() && !arg.get()->getType().isAddress())
       continue;
 
     curr = b.createMarkDependence(pai->getLoc(), curr, arg.get(),
@@ -636,8 +636,8 @@ collectStackClosureLifetimeEnds(SmallVectorImpl<SILInstruction *> &lifetimeEnds,
       continue;
     }
 
-    // at-most-once is always consumed by a call.
-    if (v->getType().hasCalledAtMostOnceSemantics() &&
+    // A closure whose call consumes it is always consumed by a call.
+    if (v->getType().isCallConsuming() &&
         (isa<ApplyInst>(consumer) || isa<TryApplyInst>(consumer))) {
       lifetimeEnds.push_back(consumer);
       continue;
@@ -662,6 +662,25 @@ static bool lookThroughMarkDependenceChainForValue(MarkDependenceInst *mark,
     return false;
   }
   return lookThroughMarkDependenceChainForValue(markChain, pai);
+}
+
+/// Returns true if \p use may write to or deinitialize the memory it uses.
+static bool mayModifyAddress(Operand *use) {
+  SILInstruction *user = use->getUser();
+  if (auto *copy = dyn_cast<CopyAddrInst>(user))
+    return use->get() == copy->getDest() || copy->isTakeOfSrc();
+  // A load [copy] only reads, but its memory behavior is conservatively
+  // reported as having side effects.
+  if (auto *load = dyn_cast<LoadInst>(user))
+    if (load->getOwnershipQualifier() == LoadOwnershipQualifier::Copy)
+      return false;
+  if (isa<EndAccessInst>(user) || isa<EndFormalScopeInst>(user))
+    return false;
+  if (auto site = ApplySite::isa(user)) {
+    if (site.isArgumentOperand(*use))
+      return !site.getCaptureConvention(*use).isGuaranteedConventionInCaller();
+  }
+  return user->mayWriteToMemory();
 }
 
 /// Rewrite a partial_apply convert_escape_to_noescape sequence with a single
@@ -738,15 +757,15 @@ static SILValue tryRewriteToPartialApplyStack(
         }
       }
 
-      // An at-most-once closure's on-stack context takes ownership of
+      // A noncopyable closure's on-stack context takes ownership of
       // its Copyable captured arguments unlike regular closures that always
-      // borrow. This is done because an at-most-once closure has a
+      // borrow. This is done because a noncopyable closure has a
       // destructor. A move-only consuming capture has to be transferred
       // into the closure, not borrowed as well.
       bool isConsumedInCaller = ApplySite(origPA)
                                     .getArgumentConvention(arg)
                                     .isOwnedConventionInCaller();
-      if (origPA->hasCalledAtMostOnceSemantics() && !foundNoImplicitCopy &&
+      if (origPA->isNoncopyable() && !foundNoImplicitCopy &&
           (!argValue->getType().isMoveOnly() || isConsumedInCaller)) {
         args.push_back(argValue);
         continue;
@@ -844,6 +863,10 @@ static SILValue tryRewriteToPartialApplyStack(
   SmallVector<SILBasicBlock *, 8> discoveredBlocks;
   SSAPrunedLiveness closureLiveness(cvt->getFunction(), &discoveredBlocks);
   closureLiveness.initializeDef(closureOp);
+  // The closure is live until its lifetime ends, so that a write to an
+  // original during that time keeps its copy.
+  for (auto *lifetimeEnd : lifetimeEnds)
+    closureLiveness.updateForUse(lifetimeEnd, /*lifetimeEnding=*/true);
 
   llvm::SmallSetVector<SILValue, 4> borrowedOriginals;
 
@@ -866,7 +889,7 @@ static SILValue tryRewriteToPartialApplyStack(
       if (copyInst && copyInst->hasOneUse() &&
           site.getArgumentConvention(arg) ==
               SILArgumentConvention::Indirect_In_Guaranteed &&
-          !newPA->hasCalledAtMostOnceSemantics() &&
+          !newPA->isNoncopyable() &&
           (!DisableCopyEliminationOfCopyableCapture ||
            copy->getType().isMoveOnly()) &&
           isLiveAcrossClosureLifetime(copyInst->getOperand(), lifetimeEnds)) {
@@ -883,6 +906,10 @@ static SILValue tryRewriteToPartialApplyStack(
       LLVM_DEBUG(llvm::dbgs() << "-- not an alloc_stack\n");
       continue;
     }
+
+    // Complete OSSA lifetimes give the closure a lifetime end on every path.
+    // Without one, the check below would pass vacuously.
+    ASSERT(!lifetimeEnds.empty());
 
     if (DisableCopyEliminationOfCopyableCapture) {
       if (!copy->getType().isMoveOnly()) {
@@ -990,13 +1017,15 @@ static SILValue tryRewriteToPartialApplyStack(
         : public TransitiveAddressWalker<
               OrigUnmodifiedDuringClosureLifetimeWalker> {
       SSAPrunedLiveness &closureLiveness;
+      ArrayRef<SILInstruction *> lifetimeEnds;
       bool &origIsUnmodifiedDuringClosureLifetime;
 
     public:
       OrigUnmodifiedDuringClosureLifetimeWalker(
           SSAPrunedLiveness &closureLiveness,
+          ArrayRef<SILInstruction *> lifetimeEnds,
           bool &origIsUnmodifiedDuringClosureLifetime)
-          : closureLiveness(closureLiveness),
+          : closureLiveness(closureLiveness), lifetimeEnds(lifetimeEnds),
             origIsUnmodifiedDuringClosureLifetime(
                 origIsUnmodifiedDuringClosureLifetime) {}
 
@@ -1005,11 +1034,14 @@ static SILValue tryRewriteToPartialApplyStack(
                    origUse->getUser()->printInContext(llvm::dbgs());
                    llvm::dbgs() << "\n");
 
-        // If the user doesn't write to memory, then it's harmless.
-        if (!origUse->getUser()->mayWriteToMemory()) {
+        // If the user doesn't write to the original, then it's harmless.
+        if (!mayModifyAddress(origUse)) {
           return true;
         }
-        if (closureLiveness.isWithinBoundary(origUse->getUser())) {
+        // isWithinBoundary() excludes the closure's lifetime ends, but the
+        // closure is still alive there.
+        if (closureLiveness.isWithinBoundary(origUse->getUser()) ||
+            llvm::is_contained(lifetimeEnds, origUse->getUser())) {
           origIsUnmodifiedDuringClosureLifetime = false;
           LLVM_DEBUG(llvm::dbgs() << "-- original has other possibly writing "
                                      "use during closure lifetime\n";
@@ -1022,7 +1054,7 @@ static SILValue tryRewriteToPartialApplyStack(
     };
 
     OrigUnmodifiedDuringClosureLifetimeWalker origUseWalker(
-        closureLiveness, origIsUnmodifiedDuringClosureLifetime);
+        closureLiveness, lifetimeEnds, origIsUnmodifiedDuringClosureLifetime);
     switch (origUseWalker.walk(orig)) {
     case AddressUseKind::NonEscaping:
     case AddressUseKind::Dependent:
@@ -1053,7 +1085,7 @@ static SILValue tryRewriteToPartialApplyStack(
   closureOp->dump();
   llvm::errs() << "--- at\n";
   */
-  // The on-stack context of an at-most-once closure takes ownership of the
+  // The on-stack context of a noncopyable closure takes ownership of the
   // noncopyable address-only arguments that the closure consumes, so there
   // is nothing for the caller to destroy after the closure's lifetime ends.
   llvm::SmallPtrSet<SILValue, 4> addressArgsOwnedByClosure;
@@ -1087,11 +1119,11 @@ static SILValue tryRewriteToPartialApplyStack(
           builder.createEndBorrow(newPA->getLoc(), argBorrow);
         }
 
-        // Unlike regular on-stack closures at-most-once don't borrow
+        // Unlike regular on-stack closures noncopyable ones don't borrow
         // their non-trivially destroyable Copyable captures because they always
         // have a destructor and so no separate cleanup for such values in
         // necessary.
-        if (newPA->hasCalledAtMostOnceSemantics() && !argBorrow &&
+        if (newPA->isNoncopyable() && !argBorrow &&
             !argValue->getType().isAddress())
           return SILValue();
 
@@ -1106,8 +1138,8 @@ static SILValue tryRewriteToPartialApplyStack(
                                        newPA->getLoc());
     };
 
-    // `try_apply` is a terminator: an at-most-once closure consumed as
-    // the callee of a throwing call ends its lifetime at the call itself, but
+    // `try_apply` is a terminator: a closure whose call consumes it, used as
+    // the callee of a throwing call, ends its lifetime at the call itself, but
     // there is no "next instruction in the same block" to insert after. The
     // consuming callee operand is spent before either successor runs, so the
     // cleanup has to be duplicated at the start of both.
@@ -1206,10 +1238,10 @@ static bool tryExtendLifetimeToLastUse(
     return true;
   }
 
-  // Prevent a copy of the closure below because they have owned convention
-  // and are forwarded through the escape -> no-escape conversion into the
-  // callee that consumed the value.
-  if (cvt->getType().hasCalledAtMostOnceSemantics())
+  // Prevent a copy of a noncopyable closure below because it is forwarded
+  // through the escape -> no-escape conversion into the callee that consumes
+  // the value.
+  if (cvt->getType().castTo<SILFunctionType>()->isNoncopyable())
     return false;
 
   // Insert a copy at the convert_escape_to_noescape [not_guaranteed] and
@@ -1327,8 +1359,7 @@ static bool trySwitchEnumPeephole(ConvertEscapeToNoEscapeInst *cvt) {
     SILInstruction *lastDestroy = nullptr;
     for (auto *use : diamondSucc2->getArgument(0)->getUses()) {
       SILInstruction *user = use->getUser();
-      if (isa<ReleaseValueInst>(user) || isa<StrongReleaseInst>(user) ||
-          isa<DestroyValueInst>(user)) {
+      if (isa<DestroyValueInst>(user)) {
         if (lastDestroy)
           return nullptr;
         lastDestroy = user;
@@ -1384,8 +1415,7 @@ static SILInstruction *getOnlyDestroy(CopyBlockWithoutEscapingInst *cb) {
     if (onlyDestroy)
       return nullptr;
 
-    if (isa<DestroyValueInst>(inst) || isa<ReleaseValueInst>(inst) ||
-        isa<StrongReleaseInst>(inst)) {
+    if (isa<DestroyValueInst>(inst)) {
       onlyDestroy = inst;
       continue;
     }
@@ -1529,9 +1559,7 @@ static bool fixupCopyBlockWithoutEscaping(CopyBlockWithoutEscapingInst *cb,
 
   SmallVector<SILPhiArgument *, 8> insertedPhis;
   SILSSAUpdater updater(&insertedPhis);
-  updater.initialize(&fn, optionalEscapingClosureTy,
-                     fn.hasOwnership() ? OwnershipKind::Owned
-                                       : OwnershipKind::None);
+  updater.initialize(&fn, optionalEscapingClosureTy, OwnershipKind::Owned);
 
   // Create the Optional.none as the beginning available value.
   SILValue entryBlockOptionalNone;
@@ -1639,13 +1667,13 @@ static bool fixupClosureLifetimes(SILFunction &fn,
       if (!cvt)
         continue;
 
-      // at-most-once has owned convention so it's always lifetime
-      // guaranteed due to owned convention, but that only means no extra
-      // `destroy_value`. Stack promotion should still be attempted were call
-      // that takes it is a lifetime ending use.
-      bool hasCalledAtMostOnceSemantics =
-          cvt->getType().hasCalledAtMostOnceSemantics();
-      if (cvt->isLifetimeGuaranteed() && !hasCalledAtMostOnceSemantics)
+      // A noncopyable conversion forwards its operand so it's always lifetime
+      // guaranteed, but that only means no extra `destroy_value`. Stack
+      // promotion should still be attempted were call that takes it is a
+      // lifetime ending use.
+      bool isNoncopyable =
+          cvt->getType().castTo<SILFunctionType>()->isNoncopyable();
+      if (cvt->isLifetimeGuaranteed() && !isNoncopyable)
         continue;
 
       // First try to peephole a known pattern.
@@ -1665,9 +1693,9 @@ static bool fixupClosureLifetimes(SILFunction &fn,
         continue;
       }
 
-      // An at-most-once conversion's ownership is already fully
+      // A noncopyable conversion's ownership is already fully
       // accounted for even when on-stack promotion above didn't apply.
-      if (hasCalledAtMostOnceSemantics) {
+      if (isNoncopyable) {
         assert(cvt->isLifetimeGuaranteed());
         continue;
       }
@@ -1696,6 +1724,12 @@ class ClosureLifetimeFixup : public SILFunctionTransform {
     // Don't rerun diagnostics on deserialized functions.
     if (getFunction()->wasDeserializedCanonical())
       return;
+
+    // SILGen only emits OSSA, but raw SIL parsed from .sil files can contain
+    // non-OSSA functions which still go through the mandatory pipeline.
+    if (!getFunction()->hasOwnership()) {
+      return;
+    }
 
     // Fixup convert_escape_to_noescape [not_guaranteed] and
     // copy_block_without_escaping instructions.

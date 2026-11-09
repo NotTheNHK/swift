@@ -2167,7 +2167,7 @@ ConstraintSystem::matchTupleTypes(TupleType *tuple1, TupleType *tuple2,
   case ConstraintKind::Conjunction:
   case ConstraintKind::DynamicTypeOf:
   case ConstraintKind::EscapableFunctionOf:
-  case ConstraintKind::DiscardableFunctionOf:
+  case ConstraintKind::DeinitableFunctionOf:
   case ConstraintKind::OpenedExistentialOf:
   case ConstraintKind::KeyPath:
   case ConstraintKind::KeyPathApplication:
@@ -2532,7 +2532,7 @@ static bool matchFunctionRepresentations(FunctionType::ExtInfo einfo1,
   case ConstraintKind::Conjunction:
   case ConstraintKind::DynamicTypeOf:
   case ConstraintKind::EscapableFunctionOf:
-  case ConstraintKind::DiscardableFunctionOf:
+  case ConstraintKind::DeinitableFunctionOf:
   case ConstraintKind::OpenedExistentialOf:
   case ConstraintKind::KeyPath:
   case ConstraintKind::KeyPathApplication:
@@ -3412,7 +3412,7 @@ ConstraintSystem::matchFunctionTypes(FunctionType *func1, FunctionType *func2,
   case ConstraintKind::Conjunction:
   case ConstraintKind::DynamicTypeOf:
   case ConstraintKind::EscapableFunctionOf:
-  case ConstraintKind::DiscardableFunctionOf:
+  case ConstraintKind::DeinitableFunctionOf:
   case ConstraintKind::OpenedExistentialOf:
   case ConstraintKind::KeyPath:
   case ConstraintKind::KeyPathApplication:
@@ -5312,32 +5312,38 @@ repairViaOptionalUnwrap(ConstraintSystem &cs, Type fromType, Type toType,
   return true;
 }
 
-static bool repairArrayLiteralUsedAsDictionary(
-    ConstraintSystem &cs, Type arrayType, Type dictType,
+static bool repairMismatchedCollectionLiteral(
+    ConstraintSystem &cs, Type literalType, Type expectedType,
     ConstraintKind matchKind,
     SmallVectorImpl<RestrictionOrFix> &conversionsOrFixes,
     ConstraintLocator *loc) {
-  if (auto *fix = TreatArrayLiteralAsDictionary::attempt(cs, dictType,
-                                                         arrayType, loc)) {
-    // Ignore any attempts at promoting the value to an optional as even after
-    // stripping off all optionals above the underlying types won't match (array
-    // vs dictionary).
-    conversionsOrFixes.erase(
-        llvm::remove_if(conversionsOrFixes,
-                        [&](RestrictionOrFix &E) {
-                          if (auto restriction = E.getRestriction())
-                            return *restriction == ConversionRestrictionKind::
-                                                       ValueToOptional ||
-                                   *restriction == ConversionRestrictionKind::
-                                                       OptionalToOptional;
-                          return false;
-                        }),
-        conversionsOrFixes.end());
+  ContextualMismatch *fix =
+    TreatArrayLiteralAsDictionary::attempt(cs, expectedType, literalType, loc);
+  if (!fix)
+    fix = TreatArrayLiteralAsTuple::attempt(cs, expectedType, literalType, loc);
+  if (!fix)
+    fix = TreatTupleAsArrayLiteral::attempt(cs, expectedType, literalType, loc);
 
-    conversionsOrFixes.push_back(fix);
-    return true;
-  }
-  return false;
+  if (!fix)
+    return false;
+
+  // Ignore any attempts at promoting the value to an optional as even after
+  // stripping off all optionals above the underlying types won't match (array
+  // vs dictionary).
+  conversionsOrFixes.erase(
+      llvm::remove_if(conversionsOrFixes,
+                      [&](RestrictionOrFix &E) {
+                        if (auto restriction = E.getRestriction())
+                          return *restriction == ConversionRestrictionKind::
+                                                     ValueToOptional ||
+                                 *restriction == ConversionRestrictionKind::
+                                                     OptionalToOptional;
+                        return false;
+                      }),
+      conversionsOrFixes.end());
+
+  conversionsOrFixes.push_back(fix);
+  return true;
 }
 
 /// Let's check whether this is an out-of-order argument in binary
@@ -5464,6 +5470,14 @@ static bool repairOutOfOrderArgumentsInBinaryFunction(
   }
 
   return false;
+}
+
+/// Whether an inline array \p count can hold exactly \p numElements elements.
+/// The comparison is done on the full-width value so that negative or very
+/// large counts never compare equal after truncation.
+static bool inlineArrayCountMatches(IntegerType *count, unsigned numElements) {
+  auto value = count->getValue();
+  return !value.isNegative() && value == numElements;
 }
 
 /// Attempt to repair typing failures and record fixes if needed.
@@ -5731,9 +5745,9 @@ bool ConstraintSystem::repairFailures(
     return Type();
   };
 
-  if (repairArrayLiteralUsedAsDictionary(*this, lhs, rhs, matchKind,
-                                         conversionsOrFixes,
-                                         getConstraintLocator(locator)))
+  if (repairMismatchedCollectionLiteral(*this, lhs, rhs, matchKind,
+                                        conversionsOrFixes,
+                                        getConstraintLocator(locator)))
     return true;
 
   if (locator.endsWith<LocatorPathElt::ThrownErrorType>()) {
@@ -6790,11 +6804,10 @@ bool ConstraintSystem::repairFailures(
         if (auto inlineCount = rhs->castTo<StructType>()
                                    ->getGenericArgs()[0]
                                    ->getAs<IntegerType>()) {
-          if (inlineCount->getValue() != literalCount) {
+          if (!inlineArrayCountMatches(inlineCount, literalCount)) {
             conversionsOrFixes.push_back(
                 AllowInlineArrayLiteralCountMismatch::create(
-                    *this, inlineCount->getValue().getSExtValue(), literalCount,
-                    loc));
+                    *this, inlineCount, literalCount, loc));
             return true;
           }
         }
@@ -7368,106 +7381,6 @@ static bool isDependentMemberTypeWithBaseThatContainsUnresolvedPackExpansions(
   });
 }
 
-/// Try implicit CGFloat conversion only if this is not:
-///     - an explicit call to a CGFloat initializer;
-///     - an explicit coercion;
-///     - a runtime type check (via `is` expression);
-///     - a checked or conditional cast;
-bool ConstraintSystem::isCGFloatDoubleConversionSupported(
-    ConstraintLocatorBuilder locator) {
-  if (getASTContext().TypeCheckerOpts.SolverEnablePromoteSupertypes) {
-    auto isCGFloatInit = [&]() {
-      auto *expr = locator.trySimplifyToExpr();
-
-      if (auto *call = dyn_cast_or_null<CallExpr>(expr)) {
-        if (auto *typeExpr = dyn_cast<TypeExpr>(call->getFn())) {
-          return getInstanceType(typeExpr)->isCGFloat();
-        }
-      }
-      return false;
-    };
-
-    auto anchor = locator.getAnchor();
-
-    auto isCoercionOrCast = [&]() {
-      // E.g. contextual conversion from coercion/cast
-      // to some other type.
-      if (!locator.endsWith<LocatorPathElt::CoercionOperand>())
-        return false;
-
-      return isExpr<CoerceExpr>(anchor) || isExpr<IsExpr>(anchor) ||
-             isExpr<ConditionalCheckedCastExpr>(anchor) ||
-             isExpr<ForcedCheckedCastExpr>(anchor);
-    };
-
-    return !isCGFloatInit() && !isCoercionOrCast();
-  } else {
-    // Look through all value-to-optional promotions to allow
-    // conversions like Double -> CGFloat?? and vice versa.
-    // T -> Optional<T>
-    if (locator.endsWith<LocatorPathElt::OptionalInjection>() ||
-        locator.endsWith<LocatorPathElt::GenericArgument>()) {
-      SmallVector<LocatorPathElt, 4> path;
-      auto anchor = locator.getLocatorParts(path);
-
-      // Drop all of the applied `value-to-optional` and
-      // `optional-to-optional` conversions.
-      path.erase(llvm::remove_if(
-                     path,
-                     [](const LocatorPathElt &elt) {
-                       return elt.is<LocatorPathElt::OptionalInjection>() ||
-                              elt.is<LocatorPathElt::GenericArgument>();
-                     }),
-                 path.end());
-
-      locator = getConstraintLocator(anchor, path);
-    }
-
-    // Support implicit Double<->CGFloat conversions only for
-    // something which could be directly represented in the AST
-    // e.g. argument-to-parameter, contextual conversions etc.
-    if (!locator.trySimplifyToExpr()) {
-      return false;
-    }
-
-    SmallVector<LocatorPathElt, 4> path;
-    auto anchor = locator.getLocatorParts(path);
-
-    // Try implicit CGFloat conversion only if:
-    // - This is not:
-    //     - an explicit call to a CGFloat initializer;
-    //     - an explicit coercion;
-    //     - a runtime type check (via `is` expression);
-    //     - a checked or conditional cast;
-    // - This is a first type such conversion is attempted for
-    //   for a given path (AST element).
-
-    auto isCGFloatInit = [&](ASTNode locator) {
-      if (auto *call = getAsExpr<CallExpr>(locator)) {
-        if (auto *typeExpr = dyn_cast<TypeExpr>(call->getFn())) {
-          return getInstanceType(typeExpr)->isCGFloat();
-        }
-      }
-      return false;
-    };
-
-    auto isCoercionOrCast = [](ASTNode anchor,
-                               ArrayRef<LocatorPathElt> path) {
-      // E.g. contextual conversion from coercion/cast
-      // to some other type.
-      if (!(path.empty() ||
-            path.back().is<LocatorPathElt::CoercionOperand>()))
-        return false;
-
-      return isExpr<CoerceExpr>(anchor) || isExpr<IsExpr>(anchor) ||
-             isExpr<ConditionalCheckedCastExpr>(anchor) ||
-             isExpr<ForcedCheckedCastExpr>(anchor);
-    };
-
-    return !isCGFloatInit(anchor) && !isCoercionOrCast(anchor, path);
-  }
-}
-
 ConstraintSystem::ImpliedResultConversionKind
 ConstraintSystem::getImpliedResultConversionKind(ConstraintLocator *locator) {
   if (locator->isLastElement<LocatorPathElt::ClosureResult>())
@@ -7745,7 +7658,7 @@ ConstraintSystem::matchTypes(Type type1, Type type2, ConstraintKind kind,
     case ConstraintKind::Conjunction:
     case ConstraintKind::DynamicTypeOf:
     case ConstraintKind::EscapableFunctionOf:
-    case ConstraintKind::DiscardableFunctionOf:
+    case ConstraintKind::DeinitableFunctionOf:
     case ConstraintKind::OpenedExistentialOf:
     case ConstraintKind::KeyPath:
     case ConstraintKind::KeyPathApplication:
@@ -8083,7 +7996,20 @@ ConstraintSystem::matchTypes(Type type1, Type type2, ConstraintKind kind,
           nominal1->getDecl() != nominal2->getDecl() &&
           ((nominal1->isCGFloat() || nominal2->isCGFloat()) &&
            (nominal1->isDouble() || nominal2->isDouble()))) {
-        if (isCGFloatDoubleConversionSupported(locator)) {
+        auto anchor = locator.getAnchor();
+
+        auto isCoercionOrCast = [&]() {
+          // E.g. contextual conversion from coercion/cast
+          // to some other type.
+          if (!locator.endsWith<LocatorPathElt::CoercionOperand>())
+            return false;
+
+          return isExpr<CoerceExpr>(anchor) || isExpr<IsExpr>(anchor) ||
+                 isExpr<ConditionalCheckedCastExpr>(anchor) ||
+                 isExpr<ForcedCheckedCastExpr>(anchor);
+        };
+
+        if (!isCoercionOrCast()) {
           conversionsOrFixes.push_back(
               desugar1->isCGFloat()
                   ? ConversionRestrictionKind::CGFloatToDouble
@@ -9407,15 +9333,13 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyConformsToConstraint(
         return SolutionKind::Solved;
       }
 
-      unsigned inlineArrayCount = 0;
-      if (auto *intCount = inlineArrayCountParam->getAs<IntegerType>()) {
-        inlineArrayCount = intCount->getValue().getZExtValue();
-      } else {
+      auto *inlineArrayCount = inlineArrayCountParam->getAs<IntegerType>();
+      if (!inlineArrayCount)
         return SolutionKind::Error;
-      }
 
       // If the counts are already equal, '2' == '2', then we're done.
-      if (inlineArrayCount == arrayLiteral->getNumElements()) {
+      if (inlineArrayCountMatches(inlineArrayCount,
+                                  arrayLiteral->getNumElements())) {
         return SolutionKind::Solved;
       }
 
@@ -13240,7 +13164,7 @@ ConstraintSystem::simplifyEscapableFunctionOfConstraint(
 }
 
 ConstraintSystem::SolutionKind
-ConstraintSystem::simplifyDiscardableFunctionOfConstraint(
+ConstraintSystem::simplifyDeinitableFunctionOfConstraint(
     Type type1, Type type2, TypeMatchOptions flags,
     ConstraintLocatorBuilder locator) {
   TypeMatchOptions subflags = getDefaultDecompositionOptions(flags);
@@ -13249,8 +13173,8 @@ ConstraintSystem::simplifyDiscardableFunctionOfConstraint(
   auto formUnsolved = [&] {
     if (flags.contains(TMF_GenerateConstraints)) {
       addUnsolvedConstraint(
-          Constraint::create(*this, ConstraintKind::DiscardableFunctionOf,
-                             type1, type2, getConstraintLocator(locator)));
+          Constraint::create(*this, ConstraintKind::DeinitableFunctionOf, type1,
+                             type2, getConstraintLocator(locator)));
       return SolutionKind::Solved;
     }
 
@@ -13264,7 +13188,7 @@ ConstraintSystem::simplifyDiscardableFunctionOfConstraint(
     // still type checks.
     auto semantics = fn2->getExtInfo().getExecutionSemantics();
     if (semantics != ExecutionSemantics::Once) {
-      if (recordFix(AllowNonExactlyOnceDiscardArgument::create(
+      if (recordFix(AllowNonExactlyOnceDeinitArgument::create(
                         *this, type2, getConstraintLocator(locator)),
                     FixImpact::TypeMismatch))
         return SolutionKind::Error;
@@ -13281,7 +13205,7 @@ ConstraintSystem::simplifyDiscardableFunctionOfConstraint(
     // Holes were already diagnosed elsewhere.
     if (type2->is<PlaceholderType>())
       return SolutionKind::Solved;
-    if (recordFix(AllowNonExactlyOnceDiscardArgument::create(
+    if (recordFix(AllowNonExactlyOnceDeinitArgument::create(
                       *this, type2, getConstraintLocator(locator)),
                   FixImpact::TypeMismatch))
       return SolutionKind::Error;
@@ -15563,13 +15487,26 @@ ConstraintSystem::simplifyRestrictedConstraintImpl(
     ArrayRef<LocatorPathElt> path(originalPath);
     simplifyLocator(anchor, path, range);
 
-    if (!path.empty() &&
+    auto isCGFloatInit = [&]() {
+      if (auto *call = getAsExpr<CallExpr>(anchor)) {
+        if (auto *typeExpr = dyn_cast<TypeExpr>(call->getFn())) {
+          return getInstanceType(typeExpr)->isCGFloat();
+        }
+      }
+      return false;
+    };
+
+    // The proposal says we should not allow conversions in CGFloat argument
+    // position at all, but it slipped through because the locator was not
+    // simplified. Allow the old behavior by severely penalizing conversions
+    // in this position.
+    if (isCGFloatInit()) {
+      impact += 100;
+    } else if (!path.empty() &&
         (path.back().is<LocatorPathElt::GenericArgument>() ||
          path.back().is<LocatorPathElt::OptionalPayload>())) {
       impact += 11;
-    }
-
-    if (restriction == ConversionRestrictionKind::DoubleToCGFloat) {
+    } else if (restriction == ConversionRestrictionKind::DoubleToCGFloat) {
       if (path.empty() || llvm::all_of(path, [](const LocatorPathElt &elt) {
             return elt.is<LocatorPathElt::OptionalInjection>();
           })) {
@@ -16386,7 +16323,9 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyFixConstraint(
   case FixKind::IgnoreContextualType:
   case FixKind::IgnoreAssignmentDestinationType:
   case FixKind::AllowConversionThroughInOut:
-  case FixKind::IgnoreCollectionElementContextualMismatch: {
+  case FixKind::IgnoreCollectionElementContextualMismatch:
+  case FixKind::TreatArrayLiteralAsTuple:
+  case FixKind::TreatTupleAsArrayLiteral: {
     auto impact = FixImpact::Mismatch;
 
     auto locator = fix->getLocator();
@@ -16518,7 +16457,7 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyFixConstraint(
   case FixKind::IgnoreInvalidPatternInExpr:
   case FixKind::IgnoreInvalidPlaceholder:
   case FixKind::IgnoreOutOfPlaceThenStmt:
-  case FixKind::AllowNonExactlyOnceDiscardArgument:
+  case FixKind::AllowNonExactlyOnceDeinitArgument:
   case FixKind::IgnoreMissingEachKeyword:
   case FixKind::TooManyDynamicMemberLookups:
   case FixKind::IgnoreNonMetatypeDynamicType:
@@ -16569,9 +16508,9 @@ ConstraintSystem::addConstraintImpl(ConstraintKind kind, Type first,
     return simplifyEscapableFunctionOfConstraint(first, second,
                                                  subflags, locator);
 
-  case ConstraintKind::DiscardableFunctionOf:
-    return simplifyDiscardableFunctionOfConstraint(first, second, subflags,
-                                                   locator);
+  case ConstraintKind::DeinitableFunctionOf:
+    return simplifyDeinitableFunctionOfConstraint(first, second, subflags,
+                                                  locator);
 
   case ConstraintKind::OpenedExistentialOf:
     return simplifyOpenedExistentialOfConstraint(first, second,
@@ -17137,8 +17076,8 @@ ConstraintSystem::simplifyConstraint(const Constraint &constraint) {
         constraint.getFirstType(), constraint.getSecondType(), std::nullopt,
         constraint.getLocator());
 
-  case ConstraintKind::DiscardableFunctionOf:
-    return simplifyDiscardableFunctionOfConstraint(
+  case ConstraintKind::DeinitableFunctionOf:
+    return simplifyDeinitableFunctionOfConstraint(
         constraint.getFirstType(), constraint.getSecondType(), std::nullopt,
         constraint.getLocator());
 

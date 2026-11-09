@@ -243,17 +243,11 @@ namespace {
 
 struct MergedBinding {
   SmallVector<Type, 3> types;
-  bool allTransitive = true;
   PointerUnion<Constraint *, ConstraintLocator *> bindingSource;
-  TypeVariableType *originator;
 
   void add(const PotentialBinding &binding) {
-    if (!binding.isTransitive())
-      allTransitive = false;
-
+    ASSERT(!binding.isTransitive());
     bindingSource = binding.BindingSource;
-    originator = binding.Originator;
-
     types.push_back(binding.BindingType);
   }
 };
@@ -313,9 +307,6 @@ void BindingSet::computeJoinsAndMeets() {
                           [](Type ty) -> bool {
                             return ty->lookThroughAllOptionalTypes()->isAnyExistentialType();
                           });
-
-    if (!supertypes.allTransitive)
-      supertypes.originator = nullptr;
 
     for (auto ty : supertypes.types) {
       if (!commonSupertype) {
@@ -379,7 +370,7 @@ void BindingSet::computeJoinsAndMeets() {
     newBindings.emplace_back(commonSupertype,
                              AllowedBindingKind::Supertypes,
                              supertypes.bindingSource,
-                             supertypes.originator);
+                             /*originator=*/nullptr);
     foundCommonSupertype = true;
   }
 
@@ -411,7 +402,7 @@ void BindingSet::computeJoinsAndMeets() {
       // Add an exact binding. It should always fail when attempted.
       newBindings.emplace_back(subtypes.types[0], AllowedBindingKind::Exact,
                                subtypes.bindingSource,
-                               subtypes.originator);
+                               /*originator=*/nullptr);
 
       // Drop all other bindings.
       std::swap(newBindings, Bindings);
@@ -446,7 +437,7 @@ void BindingSet::computeJoinsAndMeets() {
     newBindings.emplace_back(commonSubtype,
                              AllowedBindingKind::Subtypes,
                              subtypes.bindingSource,
-                             subtypes.originator);
+                             /*originator=*/nullptr);
     foundCommonSubtype = true;
   }
 
@@ -3719,7 +3710,7 @@ void PotentialBindings::infer(Constraint *constraint) {
   if (!Constraints.insert(constraint))
     return;
 
-  ++GenerationNumber;
+  GenerationNumber = CS.getNextBindingGenerationNumber();
 
   // Record the change, if there are active scopes.
   if (CS.solverState)
@@ -3778,7 +3769,7 @@ void PotentialBindings::infer(Constraint *constraint) {
   case ConstraintKind::BridgingConversion:
   case ConstraintKind::CheckedCast:
   case ConstraintKind::EscapableFunctionOf:
-  case ConstraintKind::DiscardableFunctionOf:
+  case ConstraintKind::DeinitableFunctionOf:
   case ConstraintKind::OpenedExistentialOf:
   case ConstraintKind::KeyPath:
   case ConstraintKind::SyntacticElement:
@@ -3918,7 +3909,7 @@ void PotentialBindings::retract(Constraint *constraint) {
   if (!Constraints.remove(constraint))
     return;
 
-  ++GenerationNumber;
+  GenerationNumber = CS.getNextBindingGenerationNumber();
 
   // Record the change, if there are active scopes.
   if (CS.solverState)

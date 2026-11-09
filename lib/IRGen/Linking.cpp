@@ -18,6 +18,7 @@
 #include "IRGenMangler.h"
 #include "IRGenModule.h"
 #include "swift/AST/ASTMangler.h"
+#include "swift/AST/Attr.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/Basic/CodeGenerationModel.h"
 #include "swift/ClangImporter/ClangModule.h"
@@ -181,6 +182,12 @@ std::string LinkEntity::mangleAsString(ASTContext &Ctx) const {
     return mangler.mangleValueWitnessTable(getType());
 
   case Kind::TypeMetadataAccessFunction:
+    // A module's copy of the access function for a back-deployed type has
+    // a distinct name, so that it can reference the defining module's.
+    if (auto nominal = getType()->getAnyNominal())
+      if (nominal->isBackDeployedIntoClient())
+        return mangler.mangleBackDeploymentCopyTypeMetadataAccessFunction(
+            getType());
     return mangler.mangleTypeMetadataAccessFunction(getType());
 
   case Kind::CanonicalSpecializedGenericTypeMetadataAccessFunction:
@@ -648,6 +655,32 @@ static bool isLazyEmissionOfPublicSymbolInMultipleModulesPossible(CanType ty) {
   return false;
 }
 
+/// Whether a module owns \p ty's metadata, in Embedded Swift.
+static bool isEmbeddedExportedTypeSpecialization(CanType ty) {
+  return SpecializedAttr::getExportedTypeSpecializationOwner(ty);
+}
+
+/// Whether a module owns \p conformance's witness table, in Embedded Swift.
+static bool isEmbeddedExportedConformanceSpecialization(
+    const ProtocolConformance *conformance) {
+  return SpecializedAttr::isExportedConformanceSpecialization(conformance);
+}
+
+/// Whether the witness table of \p conformance is a specialized witness table
+/// in non-embedded Swift, i.e. a witness table which is specialized for the
+/// concrete type arguments of a generic conformance. Other than the witness
+/// table of the generic conformance, such a table has no unique definition.
+/// Embedded Swift has its own rules for the linkage of witness tables.
+static bool
+isSpecializedWitnessTableConformance(const ProtocolConformance *conformance) {
+  if (conformance->getDeclContext()->getASTContext().LangOpts.hasFeature(
+          Feature::Embedded))
+    return false;
+  if (auto *inherited = dyn_cast<InheritedProtocolConformance>(conformance))
+    conformance = inherited->getInheritedConformance();
+  return isa<SpecializedProtocolConformance>(conformance);
+}
+
 SILLinkage LinkEntity::getLinkage(ForDefinition_t forDefinition) const {
   // For when `this` is a protocol conformance of some kind.
   auto getLinkageAsConformance = [&] {
@@ -676,6 +709,10 @@ SILLinkage LinkEntity::getLinkage(ForDefinition_t forDefinition) const {
   // Most type metadata depend on the formal linkage of their type.
   case Kind::ValueWitnessTable: {
     auto type = getType();
+
+    // Unique: defined by the owning module, external elsewhere.
+    if (isEmbeddedExportedTypeSpecialization(type))
+      return getSILLinkage(FormalLinkage::PublicUnique, forDefinition);
 
     // In embedded existenitals mode we generate lazy public metadata on demand
     // which makes it non unique.
@@ -723,6 +760,10 @@ SILLinkage LinkEntity::getLinkage(ForDefinition_t forDefinition) const {
     auto *nominal = getType().getAnyNominal();
     switch (getMetadataAddress()) {
     case TypeMetadataAddress::FullMetadata: {
+      // Unique: defined by the owning module, external elsewhere.
+      if (isEmbeddedExportedTypeSpecialization(getType()))
+        return getSILLinkage(FormalLinkage::PublicUnique, forDefinition);
+
       // In embedded existentials mode we generate lazy public metadata on
       // demand which makes the full metadata non-unique.
       if (isLazyEmissionOfPublicSymbolInMultipleModulesPossible(getType()))
@@ -908,6 +949,13 @@ SILLinkage LinkEntity::getLinkage(ForDefinition_t forDefinition) const {
                          forDefinition);
 
   case Kind::ProtocolWitnessTable:
+    // Unique: defined by the owning module, external elsewhere.
+    if (isEmbeddedExportedConformanceSpecialization(getProtocolConformance()))
+      return getSILLinkage(FormalLinkage::PublicUnique, forDefinition);
+    // A specialized witness table is emitted in every module which needs it.
+    if (isSpecializedWitnessTableConformance(getProtocolConformance()))
+      return SILLinkage::Shared;
+    LLVM_FALLTHROUGH;
   case Kind::ProtocolConformanceDescriptor:
   case Kind::ProtocolConformanceDescriptorRecord:
     return getLinkageForProtocolConformance(getRootProtocolConformance(),
@@ -1835,6 +1883,82 @@ bool LinkEntity::isAlwaysSharedLinkage() const {
   }
 }
 
+/// A specialization of another module's function or type that this module
+/// exports, which other modules may export too.
+bool LinkEntity::isWeakExportedSpecialization(
+    const ModuleDecl *swiftModule) const {
+  // An entity for an AST declaration, e.g. a method descriptor, is never one.
+  if (isDeclKind(getKind()))
+    return false;
+  // Created in this module, as a '@specialized' declaration without a body or
+  // extension asks for.
+  if (hasSILFunction()) {
+    auto *f = getSILFunction();
+    return f->isSpecialization() &&
+           f->getModule().createsExportedSpecializationOfImportedFunction(
+               f->getName());
+  }
+  CanType type;
+  switch (getKind()) {
+  // Like hasNonUniqueDefinition: an async or coroutine function pointer is
+  // defined like its function.
+  case Kind::CoroFunctionPointer:
+  case Kind::DispatchThunkCoroFunctionPointer:
+  case Kind::DispatchThunkInitializerCoroFunctionPointer:
+  case Kind::DispatchThunkAllocatorCoroFunctionPointer:
+  case Kind::PartialApplyForwarderCoroFunctionPointer:
+  case Kind::DistributedAccessorCoroFunctionPointer:
+    return getUnderlyingEntityForCoroFunctionPointer()
+        .isWeakExportedSpecialization(swiftModule);
+  case Kind::TypeMetadata:
+  case Kind::ValueWitnessTable:
+    type = getType();
+    break;
+  case Kind::ProtocolWitnessTable:
+    type = getProtocolConformance()->getType()->getCanonicalType();
+    break;
+  default:
+    return false;
+  }
+  return SpecializedAttr::getExportedTypeSpecializationOwner(type) ==
+             swiftModule &&
+         type->getAnyNominal()->getModuleContext() != swiftModule;
+}
+
+bool LinkEntity::isBackDeployedIntoClient() const {
+  const NominalTypeDecl *nominal = nullptr;
+  switch (getKind()) {
+  case Kind::NominalTypeDescriptor:
+  case Kind::NominalTypeDescriptorRecord:
+  case Kind::TypeMetadataPattern:
+  case Kind::TypeMetadataInstantiationCache:
+  case Kind::TypeMetadataInstantiationFunction:
+  case Kind::TypeMetadataSingletonInitializationCache:
+  case Kind::TypeMetadataCompletionFunction:
+    nominal = dyn_cast<NominalTypeDecl>(getDecl());
+    break;
+
+  case Kind::TypeMetadata:
+    nominal = getType()->getAnyNominal();
+    break;
+
+  case Kind::ProtocolWitnessTable:
+  case Kind::ProtocolConformanceDescriptor:
+  case Kind::ProtocolConformanceDescriptorRecord:
+  case Kind::ProtocolWitnessTablePattern:
+  case Kind::GenericProtocolWitnessTableInstantiationFunction: {
+    auto *dc = getDeclContextForEmission();
+    nominal = dc->getSelfNominalTypeDecl();
+    return nominal && nominal->emitsConformanceIntoClient(dc);
+  }
+
+  default:
+    return false;
+  }
+
+  return nominal && nominal->isBackDeployedIntoClient();
+}
+
 bool LinkEntity::hasNonUniqueDefinition() const {
   if (isDeclKind(getKind())) {
     auto decl = getDecl();
@@ -1866,6 +1990,10 @@ bool LinkEntity::hasNonUniqueDefinition() const {
       getKind() == Kind::ValueWitnessTable) {
     // For a nominal type, check its declaration.
     CanType type = getType();
+    // Not linkonce_odr: a single definition in the owning module, not one per
+    // separately linked library.
+    if (isEmbeddedExportedTypeSpecialization(type))
+      return false;
     if (auto nominal = type->getAnyNominal()) {
       return SILDeclRef::declHasNonUniqueDefinition(nominal);
     }
@@ -1878,6 +2006,13 @@ bool LinkEntity::hasNonUniqueDefinition() const {
   // definitions (so they get linkonce_odr linkage) unless the underlying
   // conformance was explicitly marked @export(interface).
   if (getKind() == Kind::ProtocolWitnessTable) {
+    // Not linkonce_odr: a single definition in the owning module, not one per
+    // separately linked library.
+    if (isEmbeddedExportedConformanceSpecialization(getProtocolConformance()))
+      return false;
+    if (isSpecializedWitnessTableConformance(getProtocolConformance()))
+      return true;
+
     if (auto context = getDeclContextForEmission()) {
       if (context->getParentModule()->getASTContext().LangOpts.hasFeature(
               Feature::Embedded)) {

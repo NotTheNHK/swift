@@ -52,6 +52,18 @@ let mandatoryPerformanceOptimizations = ModulePass(name: "mandatory-performance-
     // visited.
     specializeDeinitsOfEmittedMetadata(moduleContext, &handledDeinitTypes, &worklist)
 
+    // IRGen also emits the metadata of exported type specializations eagerly,
+    // even if nothing in this module uses them. A class's metadata contains
+    // its vtable, whose entries must be specialized. Usually an instruction
+    // using the class triggers that (see `optimize`), but an exported class
+    // specialization may have no such use, so specialize its vtable here.
+    for type in moduleContext.typesWithEmittedMetadata where type.isClass {
+      Optimizer.specializeVTable(forClassType: type, errorLocation: .artificialUnreachableLocation,
+                                 history: &specializationHistory, moduleContext) {
+        worklist.pushIfNotVisited($0)
+      }
+    }
+
     // Likewise, IRGen emits the witness tables of `@export(interface)`
     // conformances eagerly. Their base-protocol and associated conformance
     // entries point directly to the witness tables of the nested
@@ -335,6 +347,15 @@ private func optimize(function: Function, _ context: FunctionPassContext, _ modu
       default:
         break
       }
+    }
+
+    if context.unrollPackLoops(in: function) {
+      changed = true
+    }
+
+    // Eliminate @pack_element types here to allow any applies that use them to be specialized.
+    if tryEliminateOpenedPackElementTypes(in: function, context) {
+      changed = true
     }
 
     _ = context.specializeApplies(in: function, isMandatory: true)

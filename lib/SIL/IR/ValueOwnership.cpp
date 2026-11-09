@@ -509,6 +509,7 @@ struct ValueOwnershipKindBuiltinVisitor
 // This returns a value at +1 that is destroyed strictly /after/ the
 // UnsafeGuaranteedEnd. This provides the guarantee that we want.
 CONSTANT_OWNERSHIP_BUILTIN(Owned, COWBufferForReading)
+CONSTANT_OWNERSHIP_BUILTIN(None, InitializeForeignReferenceSubclassVTables)
 CONSTANT_OWNERSHIP_BUILTIN(None, AddressOfBorrowOpaque)
 CONSTANT_OWNERSHIP_BUILTIN(None, UnprotectedAddressOfBorrowOpaque)
 CONSTANT_OWNERSHIP_BUILTIN(None, AShr)
@@ -701,7 +702,6 @@ CONSTANT_OWNERSHIP_BUILTIN(None, EndAsyncLetLifetime)
 CONSTANT_OWNERSHIP_BUILTIN(None, CreateTaskGroup)
 CONSTANT_OWNERSHIP_BUILTIN(None, CreateTaskGroupWithFlags)
 CONSTANT_OWNERSHIP_BUILTIN(None, DestroyTaskGroup)
-CONSTANT_OWNERSHIP_BUILTIN(None, TaskRunInline)
 CONSTANT_OWNERSHIP_BUILTIN(Owned, FlowSensitiveSelfIsolation)
 CONSTANT_OWNERSHIP_BUILTIN(Owned, FlowSensitiveDistributedSelfIsolation)
 CONSTANT_OWNERSHIP_BUILTIN(None, GetEnumTag)
@@ -760,6 +760,7 @@ UNOWNED_OR_NONE_DEPENDING_ON_RESULT(Deinterleave)
 // must be owned.
 OWNED_OR_NONE_DEPENDING_ON_RESULT(ZeroInitializer)
 OWNED_OR_NONE_DEPENDING_ON_RESULT(PrepareInitialization)
+OWNED_OR_NONE_DEPENDING_ON_RESULT(TaskRunInline)
 #undef OWNED_OR_NONE_DEPENDING_ON_RESULT
 
 #define BUILTIN(X,Y,Z)

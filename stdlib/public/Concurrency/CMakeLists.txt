@@ -82,6 +82,7 @@ list(APPEND SWIFT_RUNTIME_CONCURRENCY_SWIFT_FLAGS "-strict-memory-safety")
 list(APPEND SWIFT_RUNTIME_CONCURRENCY_SWIFT_FLAGS "-enable-experimental-feature" "AllowUnsafeAttribute")
 
 list(APPEND SWIFT_RUNTIME_CONCURRENCY_SWIFT_FLAGS "-enable-experimental-feature" "Extern")
+list(APPEND SWIFT_RUNTIME_CONCURRENCY_SWIFT_FLAGS "-enable-experimental-feature" "BackDeployFrozenValueTypes")
 
 if(SWIFT_STDLIB_ENABLE_LAZY_LINK)
   list(APPEND SWIFT_RUNTIME_CONCURRENCY_SWIFT_FLAGS "-DSWIFT_STDLIB_ENABLE_LAZY_LINK")
@@ -306,6 +307,17 @@ if(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB AND SWIFT_SHOULD_BUILD_EMBEDDED_CONCURRENC
   add_custom_target(embedded-concurrency-default-executor)
   add_dependencies(embedded-libraries embedded-concurrency)
   add_dependencies(embedded-concurrency embedded-concurrency-default-executor)
+  if(SWIFT_HOST_VARIANT STREQUAL "macosx" OR
+     SWIFT_HOST_VARIANT STREQUAL "linux")
+    add_custom_target(embedded-concurrency-dispatch-executor)
+    add_dependencies(embedded-concurrency-dispatch-executor
+      "copy_embedded_swift_platform_header")
+    if(TARGET dispatch)
+      add_dependencies(embedded-concurrency-dispatch-executor dispatch)
+    endif()
+    add_dependencies(embedded-libraries
+      embedded-concurrency-dispatch-executor)
+  endif()
 
   set(SWIFT_CONCURRENCY_USES_DISPATCH FALSE)
   set(SWIFT_STDLIB_TRACING FALSE)
@@ -413,7 +425,7 @@ if(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB AND SWIFT_SHOULD_BUILD_EMBEDDED_CONCURRENC
       C_COMPILE_FLAGS
         ${extra_c_compile_flags} ${SWIFT_RUNTIME_CONCURRENCY_C_FLAGS}
         -DSWIFT_CONCURRENCY_EMBEDDED=1 -DSWIFT_RUNTIME_EMBEDDED=1
-        -ffunction-sections -fdata-sections -fno-exceptions -fno-cxx-exceptions -fno-unwind-tables
+        -fno-exceptions -fno-cxx-exceptions -fno-unwind-tables
       INSTALL_IN_COMPONENT stdlib
       )
 
@@ -429,6 +441,41 @@ if(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB AND SWIFT_SHOULD_BUILD_EMBEDDED_CONCURRENC
         -DSWIFT_CONCURRENCY_EMBEDDED=1 -DSWIFT_RUNTIME_EMBEDDED=1
       INSTALL_IN_COMPONENT stdlib
       )
+
+    set(build_embedded_dispatch_executor FALSE)
+    if(SWIFT_HOST_VARIANT STREQUAL "macosx" AND
+       "${mod}" MATCHES "-apple-macos$")
+      set(build_embedded_dispatch_executor TRUE)
+    elseif(SWIFT_HOST_VARIANT STREQUAL "linux" AND
+           "${mod}" MATCHES "-linux-gnu$")
+      set(build_embedded_dispatch_executor TRUE)
+    endif()
+
+    if(build_embedded_dispatch_executor)
+      # lib/swift/embedded/<host-triple>/libswift_ConcurrencyDispatchExecutor.a
+      add_embedded_swift_target_library(
+        embedded-concurrency-dispatch-executor
+        swift_ConcurrencyDispatchExecutor
+        PARTIAL_SOURCES_INTENDED
+        NON_EMPTY_OBJECT_FILE
+        # Dispatch requires a hosted environment, including hosted C++ headers.
+        NO_FREESTANDING_CXX
+
+        DispatchGlobalExecutor.cpp
+        DispatchExecutor.swift
+
+        DEPENDS
+          "embedded-concurrency-${mod}"
+
+        C_COMPILE_FLAGS
+          ${extra_c_compile_flags} ${SWIFT_RUNTIME_CONCURRENCY_C_FLAGS}
+          -DSWIFT_CONCURRENCY_EMBEDDED=1 -DSWIFT_RUNTIME_EMBEDDED=1
+          -DSWIFT_CONCURRENCY_USES_DISPATCH=1
+          -ffunction-sections -fdata-sections -fno-exceptions
+          -fno-cxx-exceptions -fno-unwind-tables
+        INSTALL_IN_COMPONENT stdlib
+        )
+    endif()
   endforeach()
 
   # Restore the full triple list for any later consumers.

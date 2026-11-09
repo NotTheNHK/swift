@@ -353,10 +353,14 @@ public:
       return Cached;
     }
 
-    // If the source buffer is a macro, extract its full text.
+    // If the source buffer is a macro, extract its full text. Only do so on a
+    // DIFile cache miss, as the text is ignored on a hit and every distinct
+    // location could otherwise allocate another copy of the buffer.
     std::optional<StringRef> Source;
     bool ForceGeneratedSourceToDisk = Opts.DWARFVersion < 5;
-    if (!ForceGeneratedSourceToDisk) {
+    SmallString<128> Filename(
+        SM.getDisplayNameForLoc(SL, ForceGeneratedSourceToDisk));
+    if (!ForceGeneratedSourceToDisk && !getCachedFile(Filename)) {
       auto BufferID = SM.findBufferContainingLoc(SL);
       if (auto generatedInfo = SM.getGeneratedSourceInfo(BufferID)) {
         // We only care about macro expansion buffers,
@@ -392,8 +396,7 @@ public:
           }
       }
     }
-    Cached.File = getOrCreateFile(
-        SM.getDisplayNameForLoc(SL, ForceGeneratedSourceToDisk), Source);
+    Cached.File = getOrCreateFile(Filename, Source);
     std::tie(Cached.Line, Cached.Column) =
         SM.getPresumedLineAndColumnForLoc(SL);
     // When WinDbg finds two locations with the same line but different
@@ -601,18 +604,32 @@ private:
 
 #endif
 
-  llvm::DIFile *getOrCreateFile(StringRef Filename,
-                                std::optional<StringRef> Source) {
+  /// Return \p Filename, or the compiler-generated file name if it is empty.
+  static StringRef getFilenameOrCompilerGenerated(StringRef Filename) {
     if (Filename.empty())
-      Filename = SILLocation::getCompilerGeneratedLoc()->filename;
+      return SILLocation::getCompilerGeneratedLoc()->filename;
+    return Filename;
+  }
 
-    // Look in the cache first.
-    auto CachedFile = DIFileCache.find(Filename);
+  /// Return the cached DIFile for \p Filename, or null if there is none.
+  llvm::DIFile *getCachedFile(StringRef Filename) const {
+    auto CachedFile =
+        DIFileCache.find(getFilenameOrCompilerGenerated(Filename));
     if (CachedFile != DIFileCache.end()) {
       // Verify that the information still exists.
       if (llvm::Metadata *V = CachedFile->second)
         return cast<llvm::DIFile>(V);
     }
+    return nullptr;
+  }
+
+  llvm::DIFile *getOrCreateFile(StringRef Filename,
+                                std::optional<StringRef> Source) {
+    Filename = getFilenameOrCompilerGenerated(Filename);
+
+    // Look in the cache first.
+    if (llvm::DIFile *CachedFile = getCachedFile(Filename))
+      return CachedFile;
 
     // Detect the main file.
     StringRef MainFileName = MainFile->getFilename();
@@ -1308,7 +1325,8 @@ private:
       NominalType *Type, NominalTypeDecl *Decl,
       llvm::DIScope *Scope, llvm::DIFile *File, unsigned Line,
       unsigned SizeInBits, unsigned AlignInBits, llvm::DINode::DIFlags Flags,
-      StringRef MangledName, llvm::DIType *SpecificationOf = nullptr) {
+      StringRef MangledName, llvm::DIType *SpecificationOf = nullptr,
+      llvm::DINodeArray Annotations = nullptr) {
     StringRef Name = Decl->getName().str();
     auto FwdDecl = createTemporaryReplaceableForwardDecl(
         Type, Scope, File, Line, SizeInBits, AlignInBits, Flags, MangledName,
@@ -1344,7 +1362,7 @@ private:
     llvm::DICompositeType *DITy = createStruct(
         Scope, Name, File, Line, SizeInBits, AlignInBits, Flags, MangledName,
         DBuilder.getOrCreateArray(Members), BoundParams, SpecificationOf,
-        /*Annotations=*/nullptr);
+        Annotations);
     return DBuilder.replaceTemporary(std::move(FwdDecl), DITy);
   }
 
@@ -1824,7 +1842,8 @@ private:
   createPointerSizedStruct(llvm::DIScope *Scope, StringRef Name,
                            llvm::DIFile *File, unsigned Line,
                            llvm::DINode::DIFlags Flags, StringRef MangledName,
-                           llvm::DIType *SpecificationOf = nullptr) {
+                           llvm::DIType *SpecificationOf = nullptr,
+                           llvm::DINodeArray Annotations = nullptr) {
     if (Opts.DebugInfoLevel > IRGenDebugInfoLevel::ASTTypes) {
       auto FwdDecl = DBuilder.createForwardDecl(
           llvm::dwarf::DW_TAG_structure_type, Name, Scope, File, Line,
@@ -1834,7 +1853,8 @@ private:
     } else {
       unsigned SizeInBits = CI.getTargetInfo().getPointerWidth(clang::LangAS::Default);
       return createOpaqueStruct(Scope, Name, File, Line, SizeInBits, 0, Flags,
-                                MangledName);
+                                MangledName, /*BoundParams=*/{},
+                                /*SpecificationOf=*/nullptr, Annotations);
     }
   }
 
@@ -1988,6 +2008,16 @@ private:
         MangledName);
 
     return DBuilder.replaceTemporary(std::move(FwdDecl), DITy);
+  }
+
+  /// Create a boolean annotation, which DWARF represents as a
+  /// DW_TAG_LLVM_annotation child of the annotated type.
+  llvm::MDNode *createFlagAnnotation(StringRef Name) {
+    llvm::Metadata *Ops[2] = {
+        llvm::MDString::get(IGM.getLLVMContext(), Name),
+        llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+            llvm::Type::getInt1Ty(IGM.getLLVMContext()), true))};
+    return llvm::MDNode::get(IGM.getLLVMContext(), Ops);
   }
 
   llvm::DICompositeType *
@@ -2255,15 +2285,21 @@ private:
       }
 
       unsigned FwdDeclLine = 0;
+      llvm::DINodeArray Annotations = nullptr;
+      // Foreign reference types are mangled like C structs, so nothing else
+      // tells the debugger that their values are references.
+      if (Decl->isForeignReferenceType())
+        Annotations = DBuilder.getOrCreateArray(
+            {createFlagAnnotation("swift.ForeignReferenceType")});
       if (Opts.DebugInfoLevel > IRGenDebugInfoLevel::ASTTypes) {
         if (ClassTy->isSpecialized())
           return createSpecializedStructOrClassType(
               ClassTy, Scope, L.File, L.Line, SizeInBits, AlignInBits,
               Flags, MangledName);
 
-        auto *DIType =
-            createStructType(ClassTy, Decl, Scope, File, L.Line, SizeInBits,
-                             AlignInBits, Flags, MangledName);
+        auto *DIType = createStructType(ClassTy, Decl, Scope, File, L.Line,
+                                        SizeInBits, AlignInBits, Flags,
+                                        MangledName, nullptr, Annotations);
         assert(DIType && "Unexpected null DIType!");
         assert(DIType && "createStructType should never return null!");
         auto SuperClassTy = ClassTy->getSuperclass();
@@ -2280,7 +2316,7 @@ private:
       }
       return createPointerSizedStruct(Scope, Decl->getNameStr(), L.File,
                                       FwdDeclLine, Flags, MangledName,
-                                      SpecificationOf);
+                                      SpecificationOf, Annotations);
     }
 
     case TypeKind::Existential: {
@@ -2357,11 +2393,7 @@ private:
       if (auto *PD = dyn_cast_or_null<ProtocolDecl>(Decl)) {
         SmallVector<llvm::Metadata *, 2> Annots;
         auto addFlag = [&](StringRef Name) {
-          llvm::Metadata *Ops[2] = {
-              llvm::MDString::get(IGM.getLLVMContext(), Name),
-              llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
-                  llvm::Type::getInt1Ty(IGM.getLLVMContext()), true))};
-          Annots.push_back(llvm::MDNode::get(IGM.getLLVMContext(), Ops));
+          Annots.push_back(createFlagAnnotation(Name));
         };
 
         if (PD->isMarkerProtocol())
@@ -3085,6 +3117,15 @@ private:
     if (DbgTy.isNull())
       // We can't use the empty type as an index into DenseMap.
       return createType(DbgTy, "", TheCU, MainFile);
+
+    // Only the complete type of a foreign reference type carries the
+    // annotation that tells the debugger its values are references, and it
+    // is always pointer-sized.
+    if (DbgTy.isForwardDecl())
+      if (auto *ClassTy = dyn_cast<ClassType>(DbgTy.getType()))
+        if (ClassTy->getDecl()->isForeignReferenceType())
+          DbgTy = DebugTypeInfo::getFromTypeInfo(
+              ClassTy, IGM.getTypeInfoForUnlowered(ClassTy), IGM);
 
     // Look in the cache first.
     if (auto *DITy = getTypeOrNull(DbgTy.getType())) {
@@ -4124,9 +4165,6 @@ void IRGenDebugInfoImpl::emitVariableDeclaration(
 
   for (llvm::Value *Piece : Storage) {
     SmallVector<uint64_t, 3> Operands;
-
-    if (DbgTy.getType()->isForeignReferenceType())
-      Operands.push_back(llvm::dwarf::DW_OP_deref);
 
     if (IsPiece) {
       // Advance the offset for the next piece.
