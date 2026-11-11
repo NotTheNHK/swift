@@ -137,6 +137,7 @@ struct BridgedPostDomTree {
 
 struct BridgedOptimizerUtilities {
   typedef void (* _Nonnull UpdateFunctionFn)(BridgedContext, BridgedFunction);
+  typedef bool (* _Nonnull ChangeFunctionFn)(BridgedContext, BridgedFunction);
   typedef void (* _Nonnull UpdateLifetimeFunctionFn)(BridgedContext, BridgedFunction, bool);
   typedef void (* _Nonnull UpdateLifetimeValuesFn)(BridgedContext, BridgedArrayRef, BridgedArrayRef);
   typedef BridgedInstruction (* _Nonnull UpdateInstructionFn)(BridgedContext, BridgedInstruction);
@@ -147,6 +148,7 @@ struct BridgedOptimizerUtilities {
   static void registerDebugReconstructionSimplification(
       UpdateFunctionFn simplifyDebugReconstructionBlocksFn,
       UpdateInstructionFn simplifyDebugReconstructionBlockFn);
+  static void registerBorrowAccessorFixup(ChangeFunctionFn fixupBorrowAccessorsFn);
 };
 
 struct BridgedLoopTree {
@@ -244,6 +246,14 @@ struct BridgedPassContext {
     SwiftInt otherArgIdx;
   };
 
+  struct DifferentiableFunctionArgMangling {
+    SwiftInt argIdx;
+    BridgedInstruction inst;
+    BridgedInstruction originalRoot;
+    BridgedInstruction jvpRoot;
+    BridgedInstruction vjpRoot;
+  };
+
   BridgedOwnedString mangleWithDeadArgs(BridgedArrayRef bridgedDeadArgIndices, BridgedFunction function) const;
   BridgedOwnedString mangleWithClosureArgs(BridgedArrayRef closureArgManglings, BridgedFunction applySiteCallee) const;
   BridgedOwnedString mangleWithConstCaptureArgs(BridgedArrayRef bridgedConstArgs,
@@ -252,6 +262,9 @@ struct BridgedPassContext {
                                                       BridgedFunction bridgedOriginalFunction) const;
   BridgedOwnedString mangleWithExplodedPackArgs(BridgedArrayRef bridgedPackArgs,
                                                 BridgedFunction applySiteCallee) const;
+  BridgedOwnedString mangleWithDifferentiableFunctionArgs(
+      BridgedArrayRef bridgedDifferentiableFunctionArgs,
+      BridgedFunction applySiteCallee) const;
   BridgedOwnedString mangleWithChangedRepresentation(BridgedFunction applySiteCallee) const;
 
   void inlineFunction(BridgedInstruction apply, bool mandatoryInline) const;

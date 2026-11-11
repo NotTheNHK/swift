@@ -2489,6 +2489,9 @@ function Build-CMakeProject {
         Add-KeyValueIfNew $Defines CMAKE_ANDROID_API "$AndroidAPILevel"
         Add-KeyValueIfNew $Defines CMAKE_ANDROID_ARCH_ABI $Platform.Architecture.ABI
         Add-KeyValueIfNew $Defines CMAKE_ANDROID_NDK "$AndroidNDKPath"
+        # Use the shared C++ runtime so that libraries like libswiftCore and
+        # _FoundationICU don't carry their own copy.
+        Add-KeyValueIfNew $Defines CMAKE_ANDROID_STL_TYPE c++_shared
         Add-KeyValueIfNew $Defines CMAKE_SYSROOT "$AndroidSysroot"
 
         if ($UseASM) {
@@ -3038,11 +3041,17 @@ function Build-CDispatch([Hashtable] $Platform,
     -Platform $Platform `
     -CCompiler $CCompiler `
     -CXXCompiler $CXXCompiler `
-    -Defines @{
+    -Defines (@{
       BUILD_SHARED_LIBS = $(if ($Static) { "NO" } else { "YES" });
       BUILD_TESTING = "NO";
       ENABLE_SWIFT = "NO";
-    }
+    } + $(if ($Platform.OS -eq [OS]::Android) {
+      # libdispatch doesn't use libc++, but with the shared C++ runtime it would
+      # take `__emutls_get_address` from it and depend on libc++_shared.so.
+      @{ CMAKE_ANDROID_STL_TYPE = "c++_static" }
+    } else {
+      @{}
+    }))
 }
 
 function Get-CompilersDefines([Hashtable] $Platform,
@@ -3965,12 +3974,17 @@ function Build-DS2([Hashtable] $Platform) {
     -Platform $Platform `
     -CCompiler $Compilers.Host.C `
     -CXXCompiler $Compilers.Host.CXX `
-    -Defines @{
+    -Defines (@{
       DS2_REGSGEN2 = "$(Get-ProjectBinaryCache $BuildPlatform RegsGen2)/regsgen2.exe";
       DS2_PROGRAM_PREFIX = "$(Get-ModuleTriple $Platform)-";
       BISON_EXECUTABLE = "$(Get-BisonExecutable)";
       FLEX_EXECUTABLE = "$(Get-FlexExecutable)";
-    }
+    } + $(if ($Platform.OS -eq [OS]::Android) {
+      # ds2 is a standalone executable, so keep the static C++ runtime.
+      @{ CMAKE_ANDROID_STL_TYPE = "c++_static" }
+    } else {
+      @{}
+    }))
 }
 
 function Build-BoringSSL([Hashtable] $Platform,
@@ -4142,7 +4156,7 @@ function Build-CURL([Hashtable] $Platform,
       USE_WINDOWS_SSPI = if ($Platform.OS -eq [OS]::Windows) { "YES" } else { "NO" };
       ZLIB_INCLUDE_DIR = "$BinaryCache\$($Platform.Triple)\usr\include";
       ZLIB_LIBRARY = if ($Platform.OS -eq [OS]::Windows) {
-        "$BinaryCache\$($Platform.Triple)\usr\lib\zs.lib"
+        "$BinaryCache\$($Platform.Triple)\usr\lib\libzs.lib"
       } else {
         "$BinaryCache\$($Platform.Triple)\usr\lib\libz.a"
       };
@@ -4820,6 +4834,12 @@ function Build-SDK([Hashtable] $Platform, [Hashtable] $Context) {
         dispatch_INSTALL_ARCH_SUBDIR      = "YES";
       }
       $DispatchDefines = $SDKInstallDefines + $DispatchDefines
+      if ($Platform.OS -eq [OS]::Android) {
+        # libdispatch doesn't use libc++, but with the shared C++ runtime it
+        # would take `__emutls_get_address` from it and depend on
+        # libc++_shared.so.
+        $DispatchDefines.CMAKE_ANDROID_STL_TYPE = "c++_static"
+      }
 
       Build-CMakeProject `
         -Src $SourceCache\swift-corelibs-libdispatch `
@@ -4890,7 +4910,7 @@ roots:
           CURL_DIR                          = "$BinaryCache\$($Platform.Triple)\usr\lib\cmake\CURL";
           LibXml2_DIR                       = "$BinaryCache\$($Platform.Triple)\usr\lib\cmake\libxml2-2.11.5";
           ZLIB_LIBRARY                      = if ($Platform.OS -eq [OS]::Windows) {
-                                                "$BinaryCache\$($Platform.Triple)\usr\lib\zs.lib"
+                                                "$BinaryCache\$($Platform.Triple)\usr\lib\libzs.lib"
                                               } else {
                                                 "$BinaryCache\$($Platform.Triple)\usr\lib\libz.a"
                                               };
@@ -6347,7 +6367,7 @@ if ($Windows) {
     Copy-Item -Force -Path "$(Get-ProjectBinaryCache $Build brotli)\brotlidec.lib" -Destination "${SwiftResourceDir}\brotlidec.lib" | Out-Null
     Copy-Item -Force -Path "$(Get-ProjectBinaryCache $Build CURL)\lib\libcurl.lib" -Destination "${SwiftResourceDir}\libcurl.lib" | Out-Null
     Copy-Item -Force -Path "$(Get-ProjectBinaryCache $Build XML2)\libxml2s.lib" -Destination "${SwiftResourceDir}\libxml2s.lib" | Out-Null
-    Copy-Item -Force -Path "$(Get-ProjectBinaryCache $Build ZLib)\zs.lib" -Destination "${SwiftResourceDir}\zs.lib" | Out-Null
+    Copy-Item -Force -Path "$(Get-ProjectBinaryCache $Build ZLib)\libzs.lib" -Destination "${SwiftResourceDir}\libzs.lib" | Out-Null
   }
 
   $RebuiltHostDynamicRuntime = @(

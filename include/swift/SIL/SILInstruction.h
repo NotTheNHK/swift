@@ -3021,7 +3021,7 @@ public:
 
   /// True if this application has generic substitutions.
   bool hasSubstitutions() const {
-    return Substitutions.hasAnySubstitutableParams();
+    return Substitutions.isEffectivelyGeneric();
   }
 
   /// The substitutions used to bind the generic arguments of this function.
@@ -3392,6 +3392,36 @@ public:
 
   bool hasGuaranteedAddressResult() const {
     return getSubstCalleeConv().hasGuaranteedAddressResult();
+  }
+
+  /// If the non-trivial @guaranteed result borrows a @guaranteed self value,
+  /// like a begin_borrow, return the self operand. Otherwise return nullptr.
+  Operand *getSelfObjectOfGuaranteedBorrowAccessorResult() {
+    if (!hasGuaranteedResult() || !hasSelfArgument() ||
+        getType().isTrivial(*getFunction())) {
+      return nullptr;
+    }
+    Operand &selfOperand = getSelfArgumentOperand();
+    if (selfOperand.get()->getType().isAddress()) {
+      return nullptr;
+    }
+    return &selfOperand;
+  }
+
+  /// If the result borrows an @in_guaranteed self memory location, return the
+  /// self operand, whose address must not be modified over the scope of the
+  /// result. Returns nullptr if self is @guaranteed, there is no self, or the
+  /// result is trivial.
+  Operand *getSelfAddressOfGuaranteedBorrowAccessorResult() {
+    if (!hasGuaranteedResult() || !hasSelfArgument() ||
+        getType().isTrivial(*getFunction())) {
+      return nullptr;
+    }
+    Operand &selfOperand = getSelfArgumentOperand();
+    if (!selfOperand.get()->getType().isAddress()) {
+      return nullptr;
+    }
+    return &selfOperand;
   }
 
   bool hasAddressResult() const {
@@ -4583,7 +4613,7 @@ public:
   /// True if this builtin application has substitutions, which represent type
   /// parameters to the builtin.
   bool hasSubstitutions() const {
-    return Substitutions.hasAnySubstitutableParams();
+    return Substitutions.isEffectivelyGeneric();
   }
 
   /// Return the type parameters to the builtin.
@@ -9364,6 +9394,10 @@ public:
     /// The marked address is the destination of a second initialization of
     /// immutable storage.
     LetReinit,
+
+    /// The marked address holds `self` in a derived class initializer, which
+    /// may be used before `super.init` initializes its superclass part.
+    MissingSuperInit,
   };
 
 private:

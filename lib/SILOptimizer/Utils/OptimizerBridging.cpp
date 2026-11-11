@@ -261,7 +261,7 @@ void BridgedPassContext::visitConformancesWithEagerlyEmittedWitnessTables(
         normal->getEffectiveCodeGenerationModel() !=
             CodeGenerationModel::Interface ||
         normal->getDeclContext()->getParentModule() != mod->getSwiftModule() ||
-        normal->getDeclContext()->isGenericContext())
+        normal->isEffectivelyGeneric())
       continue;
     conformances.push_back(normal);
   }
@@ -495,6 +495,24 @@ BridgedOwnedString BridgedPassContext::mangleWithExplodedPackArgs(
     mangler.setArgumentSROA((unsigned)i);
   }
 
+  return BridgedOwnedString(mangler.mangle());
+}
+
+BridgedOwnedString BridgedPassContext::mangleWithDifferentiableFunctionArgs(
+    BridgedArrayRef bridgedDifferentiableFunctionArgs,
+    BridgedFunction applySiteCallee) const {
+  auto *callee = applySiteCallee.getFunction();
+  Mangle::FunctionSignatureSpecializationMangler mangler(
+      callee->getASTContext(), Demangle::SpecializationPass::ClosureSpecializer,
+      callee->getSerializedKind(), callee);
+
+  for (auto arg : bridgedDifferentiableFunctionArgs
+                      .unbridged<DifferentiableFunctionArgMangling>()) {
+    mangler.setArgumentDifferentiableFunctionProp(
+        unsigned(arg.argIdx), arg.inst.unbridged(),
+        arg.originalRoot.unbridged(), arg.jvpRoot.unbridged(),
+        arg.vjpRoot.unbridged());
+  }
   return BridgedOwnedString(mangler.mangle());
 }
 

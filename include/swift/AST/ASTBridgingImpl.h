@@ -283,6 +283,10 @@ BridgedDeclObj BridgedDeclObj::Class_getDestructor() const {
   return {getAs<swift::ClassDecl>()->getDestructor()};
 }
 
+BridgedDeclObj BridgedDeclObj::Accessor_getStorage() const {
+  return {getAs<swift::AccessorDecl>()->getStorage()};
+}
+
 bool BridgedDeclObj::Class_isForeign() const {
   return getAs<swift::ClassDecl>()->isForeign();
 }
@@ -1120,8 +1124,8 @@ bool BridgedSubstitutionMap::isEqualTo(BridgedSubstitutionMap rhs) const {
   return unbridged() == rhs.unbridged();
 }
 
-bool BridgedSubstitutionMap::hasAnySubstitutableParams() const {
-  return unbridged().hasAnySubstitutableParams();
+bool BridgedSubstitutionMap::isEffectivelyGeneric() const {
+  return unbridged().isEffectivelyGeneric();
 }
 
 BridgedSubstitutionMap
@@ -1162,8 +1166,8 @@ BridgedGenericSignature::getCanonicalSignature() const {
   return BridgedCanGenericSignature{impl};
 }
 
-bool BridgedGenericSignature::areAllParamsConcrete() const {
-  return unbridged()->areAllParamsConcrete();
+bool BridgedGenericSignature::isEffectivelyGeneric() const {
+  return unbridged().isEffectivelyGeneric();
 }
 
 bool BridgedGenericSignature::canBeEmittedInEmbeddedSwift() const {

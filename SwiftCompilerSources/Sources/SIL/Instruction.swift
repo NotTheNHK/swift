@@ -175,16 +175,9 @@ public class Instruction : CustomStringConvertible, Hashable {
       return true
 
     case let builtin as BuiltinInst:
-      switch builtin.id {
-      case .CopyArray:
-        // Copying array elements only retains the elements. It cannot run any user code and
-        // therefore cannot observe a de-initializer running earlier.
-        return false
-      default:
-        // A memory accessing builtin can be an implicit load weak, a synchronization point or a
-        // pointer access.
-        return builtin.mayReadOrWriteMemory
-      }
+      // A memory accessing builtin can be an implicit load weak, a synchronization point or a
+      // pointer access.
+      return builtin.mayReadOrWriteMemory
 
     case let endBorrow as EndBorrowInst:
       // Accessing memory via an arbitrary pointer is a deinit barrier, because it may conflict
@@ -624,6 +617,10 @@ final public class DiagnoseInst : Instruction, UnaryInstruction {
 
     /// The marked address is the destination of a second initialization of immutable storage.
     case letReinit
+
+    /// The marked address holds `self` in a derived class initializer, which may be used before `super.init`
+    /// initializes its superclass part.
+    case missingSuperInit
   }
 
   public var kind: DiagnoseKind { DiagnoseKind(rawValue: bridged.Diagnose_getKind())! }
@@ -1788,6 +1785,24 @@ final public class ApplyInst : SingleValueInstruction, FullApplySite {
   public var specializationInfo: SpecializationInfo { bridged.ApplyInst_getSpecializationInfo() }
 
   public override var mayCallFunction: Bool { true }
+
+  /// A non-trivial object typed self of a borrow accessor with guaranteed result.
+  public var selfObjectOfGuaranteedBorrowAccessorResult: Operand? {
+    guard hasGuaranteedResult, !type.isTrivial(in: parentFunction),
+          let selfOperand = selfArgumentOperand, !selfOperand.value.type.isAddress else {
+      return nil
+    }
+    return selfOperand
+  }
+
+  /// A non-trivial address typed self of a borrow accessor with guaranteed result.
+  public var selfAddressOfGuaranteedBorrowAccessorResult: Value? {
+    guard hasGuaranteedResult, !type.isTrivial(in: parentFunction),
+          let selfAddress = selfArgument, selfAddress.type.isAddress else {
+      return nil
+    }
+    return selfAddress
+  }
 }
 
 final public class FunctionExtractIsolationInst : SingleValueInstruction {}

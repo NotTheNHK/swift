@@ -4252,7 +4252,7 @@ void IRGenSILFunction::visitFullApplySite(FullApplySite site) {
     if (IGM.getOptions().UseProfilingMarkerThunks &&
         isa<FunctionRefInst>(site.getCallee()) &&
         !site.getOrigCalleeType()->isAsync() &&
-        subMap.hasAnySubstitutableParams() &&
+        subMap.isEffectivelyGeneric() &&
         !subMap.getRecursiveProperties().hasPrimaryArchetype()) {
       emission->useProfilingThunk();
     }
@@ -7254,10 +7254,10 @@ void IRGenSILFunction::visitDeallocRefInst(swift::DeallocRefInst *i) {
   // Lower the operand.
   Explosion self = getLoweredExplosion(i->getOperand());
   auto selfValue = self.claimNext();
-  SILValue op = i->getOperand();
-  if (auto *beginDealloc = dyn_cast<BeginDeallocRefInst>(op))
-    op = beginDealloc->getAllocation();
-  auto *ARI = dyn_cast<AllocRefInstBase>(op);
+  // The operand may reach the allocation through begin_dealloc_ref, casts or
+  // phis. StripObjectHeaders looks through these when it marks an object as
+  // [bare], so a bare stack object must not get to emitClassDeallocation.
+  auto *ARI = dyn_cast<AllocRefInstBase>(findReferenceRoot(i->getOperand()));
   if (ARI && StackAllocs.count(ARI)) {
     // We can ignore dealloc_refs for stack allocated objects.
     //

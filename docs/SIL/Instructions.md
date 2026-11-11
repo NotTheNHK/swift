@@ -4541,10 +4541,36 @@ address type.
 
 The `strict` flag indicates whether the returned address adheres to
 strict aliasing. If true, then the type of each memory access dependent
-on this address must be consistent with the memory's bound type. A
-memory access from an address that is not strict cannot have its address
-substituted with a strict address, even if other nearby memory accesses
-at the same location are strict.
+on this address must be consistent with the memory's bound type.
+`UnsafeRawPointer` access omits the `strict` flag so that the same location may
+be accessed as different types, such as:
+```
+public func f(i: inout Int) -> UInt {
+  withUnsafeMutableBytes(of: &i) {
+    $0.storeBytes(of: 3, as: Int.self)
+    return $0.load(as: UInt.self) // returns '3'
+  }
+}
+```
+A `pointer_to_address` without `strict` may be substituted with a
+strictly aliased address of the same type:
+```
+%1 = pointer_to_address %0 : $Builtin.RawPointer to [strict] $*T
+%2 = address_to_pointer %1 : $*T to $Builtin.RawPointer
+%3 = pointer_to_address %2 : $Builtin.RawPointer to $*T
+use(%3)
+```
+can be optimized as:
+```
+%1 = pointer_to_address %0 : $Builtin.RawPointer to [strict] $*T
+use(%1)
+```
+This optimization cannot introduce undefined behavior because it only applies to
+addresses that have the same type as a strictly aliased address. Newly strict
+uses of the address will continue to potentially alias with other non-strict
+addresses. If this optimization applies to more than one address, then those
+addresses will continue to alias even under strict rules because they have the
+same type.
 
 The `invariant` flag is set if loading from the returned address always
 produces the same value.
@@ -5767,9 +5793,11 @@ sil-instruction ::= 'diagnose' '[' sil-diagnose-kind ']' sil-operand
 
 sil-diagnose-kind ::= 'unpermitted_copy'
                   ::= 'let_reinit'
+                  ::= 'missing_super_init'
 
 diagnose [unpermitted_copy] %1 : $T
 diagnose [let_reinit] %2 : $*T
+diagnose [missing_super_init] %3 : $*C
 ```
 
 Marks its operand as needing a diagnostic of the given kind, to be emitted
@@ -5791,6 +5819,11 @@ noncopyable value.
 If the kind is `let_reinit`, then the operand is the address of immutable
 storage, and the `diagnose` precedes an initialization of that storage
 which may happen after it was already initialized.
+
+If the kind is `missing_super_init`, then the operand is the address of
+`self` in a derived class initializer, and the `diagnose` precedes uses
+that may need the superclass part of `self` before `super.init`
+initializes it.
 
 ### end_formal_scope
 

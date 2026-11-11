@@ -2012,7 +2012,7 @@ static void emitRawApply(SILGenFunction &SGF,
                          ExecutorBreadcrumb prevExecutor) {
   // We completely drop the generic signature if all generic parameters were
   // concrete.
-  if (subs && subs.getGenericSignature()->areAllParamsConcrete())
+  if (subs && !subs.isEffectivelyGeneric())
     subs = SubstitutionMap();
 
   SILFunctionConventions substFnConv(
@@ -4232,7 +4232,12 @@ private:
                 loc, result);
           }
         }
-        result = result.materialize(SGF, loc);
+        // A borrowed value may itself be a formal-evaluation borrow, such as
+        // a borrowed subscript index, so the borrow of the temporary has to
+        // end with the formal access rather than with the enclosing scope.
+        result = SGF.isInFormalEvaluationScope()
+                     ? result.formallyMaterialize(SGF, loc)
+                     : result.materialize(SGF, loc);
       }
 
     // Otherwise, simultaneously emit and reabstract.
@@ -5825,13 +5830,14 @@ ManagedValue SILGenFunction::applyBorrowMutateAccessor(
   emitRawApply(*this, loc, fn, subs, args, substFnType, options,
                /*indirect results*/ {}, /*indirect errors*/ {}, rawResults,
                ExecutorBreadcrumb());
+  // FIXME: Support returning tuples from borrow accessors.
   assert(rawResults.size() == 1);
   auto rawResult = rawResults[0];
 
-  if (rawResult->getType().isMoveOnly()) {
-    if (rawResult->getType().isAddress()) {
-      SILFunctionConventions substFnConv(
-          substFnType, SILAddressConventions::forFunction(F));
+  if (rawResult->getType().isAddress()) {
+    if (rawResult->getType().isMoveOnly()) {
+      SILFunctionConventions substFnConv(substFnType,
+                                         SILAddressConventions::forFunction(F));
       auto result = B.createMarkUnresolvedNonCopyableValueInst(
           loc, rawResult,
           substFnConv.hasInoutResult()
@@ -5841,14 +5847,33 @@ ManagedValue SILGenFunction::applyBorrowMutateAccessor(
                     NoConsumeOrAssign);
       return ManagedValue::forRValueWithoutOwnership(result);
     }
-    auto result = emitManagedCopy(loc, rawResult);
+    return ManagedValue::forForwardedRValue(*this, rawResult);
+  }
+
+  if (rawResult->getOwnershipKind() != OwnershipKind::Guaranteed) {
+     return ManagedValue::forForwardedRValue(*this, rawResult);
+  }
+
+  // A borrow accessor with a @guaranteed result is a borrow introducer, emit
+  // with cleanup.
+  auto borrowIntroducingResult = emitFormalEvaluationManagedBorrowedRValueWithCleanup(
+        loc, rawResult, rawResult);
+
+  // If the callsite is within another borrow accessor, emit unchecked_ownership
+  // which SILGenCleanup will fixup.
+  if (getFunction().getConventions().hasGuaranteedResult()) {
+    borrowIntroducingResult = B.createUncheckedOwnership(loc, borrowIntroducingResult);
+  }
+
+  if (borrowIntroducingResult.getValue()->getType().isMoveOnly()) {
+    auto result = emitManagedCopy(loc, borrowIntroducingResult.getValue());
     result = B.createMarkUnresolvedNonCopyableValueInst(
         loc, result,
         MarkUnresolvedNonCopyableValueInst::CheckKind::NoConsumeOrAssign);
     return emitManagedBeginBorrow(loc, result.getValue());
   }
 
-  return ManagedValue::forForwardedRValue(*this, rawResult);
+  return borrowIntroducingResult;
 }
 
 RValue CallEmission::applyFirstLevelCallee(SGFContext C) {
@@ -6755,7 +6780,7 @@ SILValue SILGenFunction::emitApplyWithRethrow(SILLocation loc, SILValue fn,
                                               ArrayRef<SILValue> args) {
   // We completely drop the generic signature if all generic parameters were
   // concrete.
-  if (subs && subs.getGenericSignature()->areAllParamsConcrete())
+  if (subs && !subs.isEffectivelyGeneric())
     subs = SubstitutionMap();
 
   CanSILFunctionType silFnType = substFnType.castTo<SILFunctionType>();
@@ -6882,7 +6907,7 @@ SILGenFunction::emitBeginApplyWithRethrow(SILLocation loc, SILValue fn,
                                           SmallVectorImpl<SILValue> &yields) {
   // We completely drop the generic signature if all generic parameters were
   // concrete.
-  if (subs && subs.getGenericSignature()->areAllParamsConcrete())
+  if (subs && !subs.isEffectivelyGeneric())
     subs = SubstitutionMap();
 
   // TODO: adjust this to create try_begin_apply when appropriate.
@@ -8433,7 +8458,11 @@ ManagedValue SILGenFunction::emitBorrowMutateAccessor(
 
   CanAnyFunctionType accessType = callee.getSubstFormalType();
 
+  // Create a dead writeback scope, so that the borrow introducer of a
+  // @guaranteed result ends with the enclosing formal access just as
+  // coroutines.
   FormalEvaluationScope writebackScope(*this);
+  writebackScope.pop();
   CallEmission emission(*this, std::move(callee), std::move(writebackScope));
 
   // Self ->

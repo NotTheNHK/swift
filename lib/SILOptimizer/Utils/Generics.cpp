@@ -28,6 +28,7 @@
 #include "swift/SIL/OptimizationRemark.h"
 #include "swift/SIL/PrettyStackTrace.h"
 #include "swift/SILOptimizer/Utils/GenericCloner.h"
+#include "swift/SILOptimizer/Utils/OwnershipOptUtils.h"
 #include "swift/SILOptimizer/Utils/SILOptFunctionBuilder.h"
 #include "swift/SILOptimizer/Utils/SpecializationMangler.h"
 #include "swift/Serialization/SerializedSILLoader.h"
@@ -372,7 +373,7 @@ static bool shouldNotSpecialize(SILFunction *Callee, SILFunction *Caller,
   }
 
 
-  if (Subs.hasAnySubstitutableParams() &&
+  if (Subs.isEffectivelyGeneric() &&
       Callee->hasSemanticsAttr(semantics::OPTIMIZE_SIL_SPECIALIZE_GENERIC_PARTIAL_NEVER))
     return true;
 
@@ -381,15 +382,17 @@ static bool shouldNotSpecialize(SILFunction *Callee, SILFunction *Caller,
 
 static bool canConvertArg(CanSILFunctionType substType, unsigned paramIdx,
                           SILFunction *caller) {
-  // The `self` parameter of a borrow accessor with an indirect return
-  // cannot be promoted, since the returned address might point into the
-  // parameter.
+  // The `self` parameter of a borrow accessor cannot be promoted, since the
+  // returned address might point into the parameter, or the returned value
+  // might borrow from the parameter's memory location.
   //
   // TODO: It may be possible to promote `self` and the result if and only
   // if both the parameter and result do or do not get promoted in unison.
   if (substType->getNumResults() == 1
-      && substType->getSingleResult().getConvention()
-           == ResultConvention::GuaranteedAddress
+      && (substType->getSingleResult().getConvention()
+            == ResultConvention::GuaranteedAddress
+          || substType->getSingleResult().getConvention()
+            == ResultConvention::Guaranteed)
       && substType->getSelfParameterIndex() == paramIdx) {
     return false;
   }
@@ -481,7 +484,7 @@ bool ReabstractionInfo::prepareAndCheck(ApplySite Apply, SILFunction *Callee,
                                         SubstitutionMap ParamSubs,
                                         bool isMandatory,
                                         OptRemark::Emitter *ORE) {
-  assert(ParamSubs.hasAnySubstitutableParams());
+  assert(ParamSubs.isEffectivelyGeneric());
 
   if (shouldNotSpecialize(Callee, Apply ? Apply.getFunction() : nullptr))
     return false;
@@ -891,8 +894,7 @@ CanSILFunctionType
 ReabstractionInfo::createSubstitutedType(SILFunction *OrigF,
                                          SubstitutionMap SubstMap,
                                          bool HasUnboundGenericParams) {
-  if ((SpecializedGenericSig &&
-       SpecializedGenericSig->areAllParamsConcrete()) ||
+  if (!SpecializedGenericSig.isEffectivelyGeneric() ||
       !HasUnboundGenericParams) {
     SpecializedGenericSig = nullptr;
     SpecializedGenericEnv = nullptr;
@@ -1953,8 +1955,7 @@ void ReabstractionInfo::finishPartialSpecializationPreparation(
     CalleeParamSubMap = CallerParamSubMap;
   }
 
-  HasUnboundGenericParams =
-      SpecializedGenericSig && !SpecializedGenericSig->areAllParamsConcrete();
+  HasUnboundGenericParams = SpecializedGenericSig.isEffectivelyGeneric();
 
   createSubstitutedAndSpecializedTypes();
 
@@ -2378,7 +2379,7 @@ static SILFunction *specializeAccessorThunk(SILFunction *thunk,
 
 bool swift::specializeKeyPathInst(KeyPathInst *kpi, SILTransform *transform) {
   SubstitutionMap subs = kpi->getSubstitutions();
-  if (!subs.hasAnySubstitutableParams())
+  if (!subs.isEffectivelyGeneric())
     return false;
   // Partial specialization would leave generic thunks behind, which is exactly
   // what we're trying to avoid.
@@ -2993,7 +2994,7 @@ FullApplySite ReabstractionThunkGenerator::createApplyAndReturn(
     assert(VoidTy.isVoid());
     returnValue = Builder.createTuple(Loc, VoidTy, {});
   }
-  Builder.createReturn(Loc, returnValue);
+  createThunkReturn(Builder, Loc, returnValue);
 
   return as;
 }

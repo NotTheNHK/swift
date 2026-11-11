@@ -1762,7 +1762,7 @@ public:
 
   void printSubstitutions(SubstitutionMap Subs,
                           GenericSignature Sig = GenericSignature()) {
-    if (!Subs.hasAnySubstitutableParams()) return;
+    if (!Subs.isEffectivelyGeneric()) return;
 
     // FIXME: This is a hack to cope with cases where the substitution map uses
     // a generic signature that's close-to-but-not-the-same-as expected.
@@ -2977,6 +2977,9 @@ public:
       break;
     case DiagnoseKind::LetReinit:
       *this << "[let_reinit] ";
+      break;
+    case DiagnoseKind::MissingSuperInit:
+      *this << "[missing_super_init] ";
       break;
     }
     *this << getIDAndType(I->getOperand());
